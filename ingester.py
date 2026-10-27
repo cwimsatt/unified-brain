@@ -3,6 +3,7 @@
 alex
 """
 
+import fnmatch
 import hashlib
 import json
 import math
@@ -51,7 +52,10 @@ LANG_BY_EXT = {
     '.cmake': 'cmake',
     '.yml': 'yaml', '.yaml': 'yaml',
     '.am': 'automake', '.mk': 'make',
-    # Regex-extracted, no grammar involved:
+    '.rs': 'rust',
+    '.scad': 'openscad',
+    # No grammar involved: m4/autoconf are whole-file (MODULE_ONLY_LANGS),
+    # assembly is regex-extracted.
     '.m4': 'm4', '.ac': 'm4',
     '.s': 'asm',
 }
@@ -61,9 +65,13 @@ LANG_BY_NAME = {
     'configure': 'bash',
 }
 
-TIER1 = ('python', 'typescript', 'tsx', 'javascript', 'c', 'cpp')
+TIER1 = ('python', 'typescript', 'tsx', 'javascript', 'c', 'cpp',
+         'rust', 'openscad')
 TIER2 = ('bash', 'cmake', 'yaml', 'make')
-NO_PARSE = ('m4', 'asm', 'automake')   # regex extractors, no tree-sitter
+# Never handed to a tree-sitter grammar. asm is regex-extracted; m4/automake
+# are listed here so resolve_language skips the parse, and MODULE_ONLY_LANGS
+# below then keeps them whole-file.
+NO_PARSE = ('m4', 'asm', 'automake')
 
 # Languages symbolized at whole-file (<module>) level ONLY. Make/Automake
 # conditionals and variable blocks fragment badly under sub-file
@@ -82,6 +90,7 @@ COMMENT_STYLE = {
     'python': '#', 'bash': '#', 'cmake': '#', 'yaml': '#', 'make': '#',
     'm4': '#', 'asm': '#', 'text': '#',
     'c': '//', 'cpp': '//', 'typescript': '//', 'tsx': '//', 'javascript': '//',
+    'rust': '//', 'openscad': '//',
     'automake': '#'
 }
 
@@ -840,6 +849,171 @@ def _c_symbols(src, lang, lines, tree):
     return symbols
 
 
+# ── Rust extraction ──────────────────────────────────────────────────────────
+# structureType: 'function' | 'method' | 'prototype' | 'struct' | 'enum' |
+# 'union' | 'trait' | 'impl' | 'namespace' | 'macro' | 'constant' |
+# 'variable' | 'typedef'.
+#
+# * impl/trait members are qualified Type.method — the C++ Class.method
+#   convention. `impl<T> Trait for X<T>` qualifies as X: generic args and
+#   path segments are stripped (_norm_name maps :: to .).
+# * The impl block is ALSO stored whole as one `impl` symbol ("Drop for X"),
+#   so a trait implementation diffs as a unit even when no method body
+#   changed (a new unsafe impl, a swapped trait).
+# * `mod foo;`, use / extern crate declarations and attributes stay in
+#   <module>, like imports elsewhere. `mod foo { … }` recurses with prefix.
+# * Every field lookup may come back None on an error-recovered parse;
+#   nothing here raises. A file that yields no symbol falls back to the
+#   whole-file guarantee in extract_symbols.
+
+_RUST_ITEM_KINDS = {
+    'struct_item': 'struct', 'enum_item': 'enum', 'union_item': 'union',
+    'macro_definition': 'macro', 'const_item': 'constant',
+    'static_item': 'variable', 'type_item': 'typedef',
+    'associated_type': 'typedef',
+}
+
+
+def _rust_type_name(node, src):
+    """Bare name of a type / trait node: Vec<T> -> Vec, fmt::Display ->
+    Display, &'a mut X -> X, dyn Fn() + Send -> Fn, [u8; 4] -> u8. None
+    when there is no node or the type has no name of its own (a tuple,
+    `()`, a bare fn pointer): passing those through verbatim would put
+    commas, parens and spaces into Type.method names and the TAG field."""
+    for _ in range(8):
+        if node is None:
+            return None
+        t = node.type
+        if t in ('generic_type', 'reference_type', 'pointer_type',
+                 'higher_ranked_trait_bound'):      # for<'a> Fn(&'a T)
+            node = node.child_by_field_name('type')
+        elif t in ('scoped_type_identifier', 'scoped_identifier'):
+            node = node.child_by_field_name('name')
+        elif t in ('dynamic_type', 'abstract_type'):
+            node = node.child_by_field_name('trait')
+        elif t == 'bounded_type':               # dyn A + Send: the first bound
+            node = next((c for c in node.named_children
+                         if c.type != 'lifetime'), None)
+        elif t == 'array_type':                 # [u8; 4] -> u8
+            node = node.child_by_field_name('element')
+        elif t == 'function_type':              # Fn(u32) -> Fn; fn(u32) -> None
+            node = node.child_by_field_name('trait')
+        elif t in ('tuple_type', 'unit_type'):
+            return None
+        else:
+            break
+    if node is None:
+        return None
+    return _norm_name(_text(node, src)) or None
+
+
+def _rust_symbols(src, lang, lines, tree):
+    symbols = []
+
+    def add(name, node, struct, prefix=''):
+        if not name:
+            return None
+        full = _norm_name(f'{prefix}.{name}' if prefix else name)
+        if not full:
+            return None
+        sym = {
+            'name': full,
+            'line': _line(node),
+            'structureType': struct,
+            'code': _truncate_body(_text(node, src), lang),
+            '_end': _end_line(node),
+        }
+        symbols.append(sym)
+        return sym
+
+    def field_text(node, field):
+        n = node.child_by_field_name(field)
+        return _text(n, src) if n is not None else None
+
+    def body_items(node):
+        body = node.child_by_field_name('body')
+        return body.children if body is not None else ()
+
+    def handle(node, prefix='', member=False):
+        t = node.type
+        if t in ('function_item', 'function_signature_item'):
+            if member:
+                struct = 'method'
+            else:
+                struct = 'function' if t == 'function_item' else 'prototype'
+            add(field_text(node, 'name'), node, struct, prefix)
+        elif t in _RUST_ITEM_KINDS:
+            add(field_text(node, 'name'), node, _RUST_ITEM_KINDS[t], prefix)
+        elif t == 'trait_item':
+            name = field_text(node, 'name')
+            if add(name, node, 'trait', prefix) is None:
+                return
+            inner = _norm_name(f'{prefix}.{name}' if prefix else name)
+            for c in body_items(node):
+                handle(c, inner, True)
+        elif t == 'impl_item':
+            ty = _rust_type_name(node.child_by_field_name('type'), src)
+            trait = _rust_type_name(node.child_by_field_name('trait'), src)
+            if not ty and not trait:
+                return
+            # A type with no name of its own (`impl Tr for (A, B)`): the
+            # impl is stored by its trait and the members stay unqualified.
+            add(f'{trait} for {ty}' if trait and ty else (ty or trait),
+                node, 'impl', prefix)
+            inner = _norm_name(f'{prefix}.{ty}' if prefix else ty) if ty else prefix
+            for c in body_items(node):
+                handle(c, inner, True)
+        elif t == 'mod_item':
+            name = field_text(node, 'name')
+            if not name or node.child_by_field_name('body') is None:
+                return                          # `mod foo;` stays in <module>
+            add(name, node, 'namespace', prefix)
+            inner = _norm_name(f'{prefix}.{name}' if prefix else name)
+            for c in body_items(node):
+                handle(c, inner)
+        elif t == 'foreign_mod_item':           # extern "C" { fn …; }
+            for c in body_items(node):
+                handle(c, prefix)
+
+    for top in tree.root_node.children:
+        handle(top)
+    return symbols
+
+
+# ── OpenSCAD extraction ──────────────────────────────────────────────────────
+# structureType: 'scad_module' | 'function' | 'constant' | 'variable'.
+# A module declaration is deliberately NOT 'module': the service reads
+# structureType 'module' as the whole-file <module> symbol, which would make
+# every `module box(w) { … }` look like a file. Top-level `X = …;` become
+# constant/variable; include/use statements and bare top-level calls stay in
+# <module>, like imports and statements elsewhere.
+
+def _openscad_symbols(src, lang, lines, tree):
+    symbols = []
+
+    def add(name, node, struct):
+        name = _norm_name(name)
+        if name:
+            symbols.append({'name': name, 'line': _line(node),
+                            'structureType': struct,
+                            'code': _truncate_body(_text(node, src), lang),
+                            '_end': _end_line(node)})
+
+    for top in tree.root_node.children:
+        t = top.type
+        if t in ('module_declaration', 'function_declaration'):
+            name_node = top.child_by_field_name('name')
+            if name_node is not None:
+                add(_text(name_node, src), top,
+                    'scad_module' if t == 'module_declaration' else 'function')
+        elif t == 'assignment':
+            left = top.child_by_field_name('left')
+            if left is not None:
+                name = _text(left, src)
+                add(name, top, 'constant' if name.isupper() else 'variable')
+    return symbols
+
+
 # ── Bash extraction (Tier 2) ─────────────────────────────────────────────────
 
 def _bash_symbols(src, lang, lines, tree):
@@ -966,38 +1140,6 @@ def _yaml_symbols(src, lang, lines, tree):
     return symbols
 
 
-# ── m4 / autoconf extraction (regex, no grammar) ─────────────────────────────
-# One symbol per AC_DEFUN block — build-to-host.m4-class injections diff at
-# macro granularity. Files without DEFUNs (configure.ac) land in <module>.
-
-_M4_DEFUN_RE = re.compile(r'^(?:AC|AU|AM)_DEFUN(?:_ONCE)?\(\[?([\w+-]+)\]?',
-                          re.M)
-
-
-def _m4_symbols(content, lines):
-    symbols = []
-    for m in _M4_DEFUN_RE.finditer(content):
-        start = m.start()
-        depth, end = 0, len(content)
-        for i in range(content.index('(', start), len(content)):
-            ch = content[i]
-            if ch == '(':
-                depth += 1
-            elif ch == ')':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        symbols.append({
-            'name': _norm_name(m.group(1)),
-            'line': content.count('\n', 0, start) + 1,
-            'structureType': 'macro',
-            'code': _truncate_body(content[start:end], 'm4'),
-            '_end': content.count('\n', 0, end) + 1,
-        })
-    return symbols
-
-
 # ── Assembly extraction (regex, no grammar) ──────────────────────────────────
 # Label-delimited: each label owns the lines up to the next label. Directives
 # before the first label go to <module>.
@@ -1022,47 +1164,6 @@ def _asm_symbols(content, lines):
     return symbols
 
 
-# ── Automake extraction (regex — the make grammar mis-parses if/endif) ───────
-# Repeated `VAR += …` occurrences are distinct symbols disambiguated by line,
-# exactly the match_occurrences case.
-
-_AM_ASSIGN_RE = re.compile(r'^([A-Za-z_@][\w@.+-]*)\s*[:+?]?=', re.M)
-_AM_RULE_RE = re.compile(r'^([^\s:#=][^:=\n]*):(?!=)', re.M)
-
-
-def _automake_symbols(content, lines):
-    symbols = []
-
-    def cont_end(start_line):
-        i = start_line
-        while i <= len(lines) and lines[i - 1].rstrip().endswith('\\'):
-            i += 1
-        return i
-
-    seen = set()
-    for m in _AM_ASSIGN_RE.finditer(content):
-        line = content.count('\n', 0, m.start()) + 1
-        end = cont_end(line)
-        name = m.group(1)
-        symbols.append({'name': _norm_name(name), 'line': line,
-                        'structureType': 'constant' if name.isupper()
-                        else 'variable',
-                        'code': '\n'.join(lines[line - 1:end]), '_end': end})
-        seen.add(line)
-    for m in _AM_RULE_RE.finditer(content):
-        line = content.count('\n', 0, m.start()) + 1
-        if line in seen:
-            continue
-        end = cont_end(line)
-        while end < len(lines) and (lines[end].startswith('\t')
-                                    or not lines[end].strip()):
-            end += 1
-        symbols.append({'name': _norm_name(m.group(1).split()[0]),
-                        'line': line, 'structureType': 'function',
-                        'code': '\n'.join(lines[line - 1:end]), '_end': end})
-    return symbols
-
-
 # ── Call-site extraction ──────────────────────────────────────────────────────
 # Emits per-symbol outgoing calls: [{"name","line","snippet"}], consumed by
 # skills_lib.write_call_edges (calls:/called_by:/commit_calls: schema).
@@ -1078,6 +1179,8 @@ _CALL_TYPES = {
     'cpp':        {'call_expression', 'new_expression'},
     'bash':       {'command'},
     'cmake':      {'normal_command'},
+    'rust':       {'call_expression', 'macro_invocation'},
+    'openscad':   {'module_call', 'function_call'},
 }
 
 
@@ -1110,6 +1213,13 @@ def _rightmost_identifier(node, src, depth=0):
     if t in ('template_function', 'template_method'):
         return _rightmost_identifier(node.child_by_field_name('name'), src,
                                      depth + 1)
+    if t in ('scoped_identifier', 'scoped_type_identifier'):   # Rust a::b::c
+        return _rightmost_identifier(node.child_by_field_name('name'), src,
+                                     depth + 1)
+    if t in ('generic_function', 'generic_type'):              # Rust f::<T>
+        return _rightmost_identifier(
+            node.child_by_field_name('function')
+            or node.child_by_field_name('type'), src, depth + 1)
     if t == 'subscript_expression':
         return _rightmost_identifier(node.child_by_field_name('argument'), src,
                                      depth + 1)
@@ -1137,6 +1247,15 @@ def _extract_calls(tree, src, lang, lines):
                          None)
             if ident is not None:
                 name = _text(ident, src)
+        elif lang == 'openscad' and node.type == 'module_call':
+            # cube(w) names its callee `name`; a function_call (area(x))
+            # falls through to the default branch (field `function`).
+            cn = node.child_by_field_name('name')
+            if cn is not None:
+                name = _text(cn, src)
+        elif lang == 'rust' and node.type == 'macro_invocation':
+            # println!(…) -> println; the `!` is not part of the name.
+            name = _rightmost_identifier(node.child_by_field_name('macro'), src)
         else:
             fn = node.child_by_field_name('function') \
                 or node.child_by_field_name('constructor')
@@ -1686,8 +1805,25 @@ def _text_symbols(content, lang_hint=''):
 
 # ── Unified extraction entrypoint ─────────────────────────────────────────────
 
+def _skip_globs():
+    """UB_SKIP_GLOBS: comma-separated fnmatch patterns (`*.jsonl`,
+    `vendor/fixtures/*`), matched against the repo-relative path and against
+    the basename. Read per call, not at import: next_claude.py imports this
+    module before load_dotenv() runs."""
+    raw = os.environ.get('UB_SKIP_GLOBS', '')
+    return [g.strip() for g in raw.split(',') if g.strip()]
+
+
 def is_ingestable(path):
-    return not any(s in f'/{path}' for s in SKIP_PATHS)
+    if any(s in f'/{path}' for s in SKIP_PATHS):
+        return False
+    globs = _skip_globs()
+    if globs:
+        base = os.path.basename(path)
+        if any(fnmatch.fnmatch(path, g) or fnmatch.fnmatch(base, g)
+               for g in globs):
+            return False
+    return True
 
 
 def _is_binary(data):
@@ -1731,7 +1867,8 @@ def resolve_language(file_path, content):
         if base.startswith('Makefile'):
             # .am/.inc are automake dialect: the make grammar mis-parses
             # if/endif as rules at an error ratio BELOW the gate (verified
-            # 0.029 on liblzma/Makefile.am) — regex extraction instead.
+            # 0.029 on liblzma/Makefile.am) — whole-file instead
+            # (MODULE_ONLY_LANGS).
             lang = 'automake' if ext in ('.am', '.inc') else 'make'
         else:
             lang = LANG_BY_EXT.get(ext)
@@ -1784,6 +1921,8 @@ _TIER1_EXTRACTORS = {
     'javascript': _ts_symbols,
     'c':          _c_symbols,
     'cpp':        _c_symbols,
+    'rust':       _rust_symbols,
+    'openscad':   _openscad_symbols,
 }
 
 _TIER2_EXTRACTORS = {
@@ -1793,10 +1932,10 @@ _TIER2_EXTRACTORS = {
     'make':  _make_symbols,
 }
 
+# m4/automake are MODULE_ONLY_LANGS: extract_symbols returns the whole file
+# for them before this table is consulted.
 _NO_PARSE_EXTRACTORS = {
-    'm4':       _m4_symbols,
-    'asm':      _asm_symbols,
-    'automake': _automake_symbols,
+    'asm': _asm_symbols,
 }
 
 
@@ -1885,6 +2024,8 @@ def extract_symbols(content, file_path):
 #   python: 'FunctionDef' | 'AsyncFunctionDef' | 'ClassDef' | 'module'
 #   ts/js:  'function' | 'class' | 'module'
 #   c/cpp:  'function' | 'class' | 'module'
+#   rust:   'function' | 'class' | 'module'   (impl/trait/mod count as class)
+#   openscad: 'function' | 'module'
 
 _SCOPE_FN_TYPES = {
     'python': {'function_definition'},
@@ -1892,12 +2033,16 @@ _SCOPE_FN_TYPES = {
     'cpp':    {'function_definition', 'lambda_expression'},
     'bash':   {'function_definition'},
     'cmake':  {'function_def', 'macro_def'},
+    'rust':   {'function_item', 'function_signature_item'},
+    'openscad': {'module_declaration', 'function_declaration'},
 }
 _SCOPE_CLS_TYPES = {
     'python': {'class_definition'},
     'c':      {'struct_specifier', 'union_specifier', 'enum_specifier'},
     'cpp':    {'class_specifier', 'struct_specifier', 'union_specifier',
                'namespace_definition'},
+    'rust':   {'struct_item', 'enum_item', 'union_item', 'trait_item',
+               'impl_item', 'mod_item'},
 }
 _TS_SCOPE_FN = {'function_declaration', 'generator_function_declaration',
                 'method_definition', 'arrow_function', 'function_expression'}
@@ -1925,6 +2070,8 @@ def _scope_spans(src, lang, tree=None):
             nm = _c_declarator_name(d)
             if nm is not None:
                 return _text(nm, src)
+        if node.type == 'impl_item':            # Rust `impl<T> Trait for X<T>`
+            return _rust_type_name(node.child_by_field_name('type'), src)
         return None
 
     def visit(node, class_name):
@@ -2067,13 +2214,17 @@ class GitDiffIngester:
         --root fallback covers the parentless root commit."""
         parent = self.parent_hash(h)
         if parent:
-            out = self.git('diff', '--no-renames', '--name-only',
+            out = self.git('diff', '--no-renames', '--name-only', '-z',
                            f'--diff-filter={diff_filter}', parent, h)
         else:
             out = self.git('diff-tree', '--root', '--no-commit-id', '-r',
-                           '--name-only', f'--diff-filter={diff_filter}', h)
-        return [f for f in (l.strip() for l in out.split('\n'))
-                if f and is_ingestable(f)]
+                           '--name-only', '-z',
+                           f'--diff-filter={diff_filter}', h)
+        # -z: NUL-separated and never quoted. Without it a non-ASCII path
+        # comes back as "\303\251…" in quotes, `git show h:path` fails and
+        # the file is silently skipped. Names are taken verbatim (no strip):
+        # a path may legitimately carry edge whitespace.
+        return [f for f in out.split('\0') if f and is_ingestable(f)]
 
     def changed_files(self, h):
         return self._diff_names(h, 'ACMR')
@@ -2104,20 +2255,15 @@ class GitDiffIngester:
 
     def commit_range(self, since=None, max_n=None):
         if since:
+            # `since` is exclusive: the commits after it, oldest first.
+            # since..HEAD is empty only when HEAD is reachable from since
+            # (--resume on an up-to-date repo, or since ahead of HEAD), and
+            # that is genuinely empty — the old unconditional fallback
+            # re-ingested the entire history on every --resume. An unknown
+            # ref raises from git log.
             out = self.git('log', '--format=%H', '--topo-order', '--reverse',
                            f'{since}..HEAD')
             hashes = [h for h in out.split('\n') if h]
-            if not hashes:
-                # Root-commit fallback: sinceRef..HEAD excludes sinceRef itself,
-                # so a root ref yields nothing — return full history instead.
-                try:
-                    root = self.git('rev-parse', since)
-                    self.git('cat-file', '-e', root)
-                    out = self.git('log', '--format=%H', '--topo-order',
-                                   '--reverse')
-                    hashes = [h for h in out.split('\n') if h]
-                except Exception:
-                    hashes = []
             return hashes[:max_n] if max_n else hashes
         count = f'-{max_n}' if max_n else ''
         args = ['log', '--format=%H', '--topo-order'] + ([count] if count else [])
@@ -2360,8 +2506,8 @@ def scan_coverage(repo_path):
     """
     ing = GitDiffIngester(repo_path)
     head = ing.head_hash()
-    out = ing.git('ls-tree', '-r', '--name-only', head)
-    paths = [p for p in out.split('\n') if p and is_ingestable(p)]
+    out = ing.git('ls-tree', '-r', '--name-only', '-z', head)
+    paths = [p for p in out.split('\0') if p and is_ingestable(p)]
 
     def bucket(path):
         base = os.path.basename(path)
