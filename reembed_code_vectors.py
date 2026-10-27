@@ -10,7 +10,10 @@ ends. By hand:
     python reembed_code_vectors.py --provider voyage [--dry-run]
         [--slab 200] [--workers 4] [--full] [--force]
     python reembed_code_vectors.py --provider qwen
-(--db /path/to/repo/.unified-brain.db or DB_PATH in .env; the store's key from .env)
+    python reembed_code_vectors.py --provider none      # nothing to embed, exit 0
+(--provider absent: the first store CODE_EMBED_PASS2 names, or the store whose
+key is set; --db /path/to/repo/.unified-brain.db or DB_PATH in .env; the
+store's key from .env)
 
 What it does per atomic skill (active and deleted):
   1. Reads the skill's version list: skill_history entries + the current
@@ -360,8 +363,19 @@ def _arg(name, default=None):
 def main():
     dry = "--dry-run" in sys.argv
     provider = _arg("--provider")
+    if provider is None:
+        # the first store CODE_EMBED_PASS2 names (unset: the store whose key is set)
+        raw = os.environ.get("CODE_EMBED_PASS2")
+        resolve = getattr(skills_lib, "default_code_store", None)
+        raw = resolve(raw) if resolve is not None else (raw or "none")
+        provider = raw.split(",")[0]
+    provider = provider.strip().lower()
+    if provider in ("", "none", "off"):
+        print("nothing to embed: no code-vector store configured "
+              "(--provider none / CODE_EMBED_PASS2=none)")
+        return
     if provider not in KEY_ENV:
-        sys.exit("--provider voyage|qwen is required")
+        sys.exit("--provider none|voyage|qwen is required")
 
     db = _arg("--db") or os.environ.get("DB_PATH", "")
     if not db:

@@ -5,8 +5,10 @@ __pycache__/
 .venv/
 venv/
 *.db
+*.db-wal
+*.db-shm
 *.rdb
 dump.rdb
 .DS_Store
 .idea/
-.vscode/
+.vscode/.pytest_cache/

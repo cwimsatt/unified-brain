@@ -11,4 +11,4 @@ openai==2.14.0
 voyageai>=0.3.7
 python-dotenv==1.2.1
 tree-sitter-language-pack>=1.22.1
-mcp>=1.0
+mcp>=1.0,<3

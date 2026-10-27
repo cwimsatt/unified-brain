@@ -16,8 +16,10 @@ When the commits are done, one embedding pass fills the code-vector store
     python next_claude.py /path/to/repo --embed-only    # only the embedding pass
     python next_claude.py /path/to/repo --db /elsewhere/x.db   # database file elsewhere
 
-Settings (.env): CODE_EMBED_PASS2 (voyage | qwen), VOYAGE_API_KEY /
-DEEPINFRA_API_KEY, CODE_EMBED_PASS2_WORKERS.
+Settings (.env): CODE_EMBED_PASS2 (none | voyage | qwen; unset: the store
+whose key is set), VOYAGE_API_KEY / DEEPINFRA_API_KEY, CODE_EMBED_PASS2_WORKERS.
+Exit status 1 when a commit or an embedding batch failed, or when
+CODE_EMBED_PASS2 names a store whose key or SDK is missing (no vectors written).
 """
 import asyncio
 import json
@@ -45,10 +47,24 @@ def _db_clients(db_path: str) -> tuple:
     return r, r.binary()
 
 
+def _pass2_store_names() -> list:
+    """The store names CODE_EMBED_PASS2 selects: [] for none / off / empty.
+    Unset: the store whose key is set (skills_lib.default_code_store)."""
+    raw = os.environ.get("CODE_EMBED_PASS2")
+    resolve = getattr(skills_lib, "default_code_store", None)
+    if resolve is not None:
+        raw = resolve(raw)
+    elif raw is None:
+        raw = "voyage"                    # the default before default_code_store existed
+    names = [p.strip().lower() for p in raw.split(",")]
+    return [p for p in names if p and p not in ("none", "off")]
+
+
 def _pass2_embedders() -> list:
-    """The code-vector stores filled after the run (CODE_EMBED_PASS2)."""
+    """The code-vector stores filled after the run (CODE_EMBED_PASS2).
+    [] when no store is named (none) or a named store has no key."""
     out = []
-    for name in [p.strip() for p in os.environ.get("CODE_EMBED_PASS2", "voyage").split(",") if p.strip()]:
+    for name in _pass2_store_names():
         emb = skills_lib.make_code_embedder(name, os.environ.get(_CODE_EMBED_KEYS.get(name, ""), ""))
         if emb is None:
             print(f"⚠️  code-vector store '{name}' OFF (key or SDK missing)")
@@ -316,21 +332,33 @@ async def ingest_repo(repo_path: str, *, since: str | None, max_n: int | None,
     return totals
 
 
-def embed_pass(r, rb) -> None:
+def embed_pass(r, rb) -> int:
     """One embedding pass over every stored body version (the only
-    embedding call of the run)."""
+    embedding call of the run). Returns the number of failed batches plus
+    the number of named stores that could not be used (key or SDK
+    missing): a run asked to embed that wrote no vectors must not look
+    finished. 0 when no store is configured (CODE_EMBED_PASS2=none)."""
+    names = _pass2_store_names()
+    if not names:
+        print("\n🧬 embedding pass skipped (CODE_EMBED_PASS2=none)")
+        return 0
     embs = _pass2_embedders()
+    unusable = max(0, len(names) - len(embs))
     if not embs:
-        print("⚠️  no code-vector store configured (CODE_EMBED_PASS2) — skipping embeddings")
-        return
+        print("❌ no usable code-vector store (CODE_EMBED_PASS2 names a store whose "
+              "key or SDK is missing) — no vectors written")
+        return unusable
     workers = int(os.environ.get("CODE_EMBED_PASS2_WORKERS", "4"))
     reembed_code_vectors.mark_waiting(r, [e.name for e in embs])
+    failed = 0
     for emb in embs:
         print(f"\n🧬 embedding pass [{emb.name}]")
         total = reembed_code_vectors.run(r, rb, emb, workers=workers)
         print(f"   {total['versions']} versions of {total['skills']} skills: "
               f"{total['embedded']} embedded, {total['kept']} already stored, "
               f"{total['failed']} failed batch(es)")
+        failed += int(total.get("failed", 0) or 0)
+    return failed + unusable
 
 
 def _arg(name: str, default=None):
@@ -356,20 +384,26 @@ def main() -> None:
     print(f"📁 database: {db_path}")
 
     t0 = time.time()
+    failed_commits = failed_batches = 0
     if "--embed-only" not in sys.argv:
         since = _arg("--since")
         if "--resume" in sys.argv and not since:
             since = r.get("resume_point") or None
         max_n = int(_arg("--max")) if _arg("--max") else None
         totals = asyncio.run(ingest_repo(repo_path, since=since, max_n=max_n, r=r, rb=rb))
+        failed_commits = totals["failed"]
         print(f"\n✅ {totals['done']} commit(s) ingested, {totals['skipped']} with no symbol change, "
               f"{totals['failed']} failed; skills created={totals['created']} "
               f"updated={totals['updated']} obsoleted={totals['obsoleted']} "
               f"in {time.time() - t0:.0f}s")
         r.optimize()                      # merge the text index after the writes
     if "--no-embed" not in sys.argv:
-        embed_pass(r, rb)
+        failed_batches = embed_pass(r, rb)
     print(f"\n⏱  total {time.time() - t0:.0f}s")
+    if failed_commits or failed_batches:
+        # a failed run must not look like a finished one to the caller
+        print(f"❌ {failed_commits} commit(s) and {failed_batches} embedding batch(es) failed")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
