@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unified-brain"
+version = "0.1.0"
+description = "Every symbol version of a git history in one SQLite file, judged by Jev: evidence for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+# The same pins as requirements.txt (the ones the cloud service runs).
+dependencies = [
+    "fastapi==0.133.0",
+    "uvicorn==0.41.0",
+    "pydantic==2.12.5",
+    "sqlite-vec>=0.1.6",
+    "numpy==2.4.3",
+    "httpx==0.28.1",
+    "litellm==1.82.0",
+    "openai==2.14.0",
+    "voyageai>=0.3.7",
+    "python-dotenv==1.2.1",
+    "tree-sitter-language-pack>=1.22.1",
+    "mcp>=1.0,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+py-modules = [
+    "codebase_qa_service",
+    "defkey_reconciler",
+    "ingester",
+    "next_claude",
+    "reembed_code_vectors",
+    "skills_lib",
+    "store",
+    "templates",
+    "unified_brain_mcp",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
