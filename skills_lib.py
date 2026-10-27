@@ -15,6 +15,7 @@ explicitly.
 """
 
 import json
+import os
 import struct
 import uuid
 import hashlib
@@ -208,6 +209,23 @@ def make_code_embedder(name: str, api_key: str) -> Optional["CodeEmbedder"]:
         return CodeEmbedder(name, OpenAI(api_key=api_key,
                                          base_url=DEEPINFRA_OPENAI_BASE))
     raise ValueError(f"unknown code embedder {name!r}")
+
+
+def default_code_store(raw: Optional[str]) -> str:
+    """The code-vector store a setting names (QA_VECTOR_STORE in the service,
+    CODE_EMBED_PASS2 in the ingester). None (the variable is unset): the
+    store whose key is set, qwen (DEEPINFRA_API_KEY) before voyage
+    (VOYAGE_API_KEY), else "none". "" or "off": "none" (no pre-filter; Jev
+    scores every skill, the ingester embeds nothing). Any other value is
+    returned as given (stripped, lower-cased; a comma list stays a list)."""
+    if raw is None:
+        if os.environ.get("DEEPINFRA_API_KEY"):
+            return "qwen"
+        if os.environ.get("VOYAGE_API_KEY"):
+            return "voyage"
+        return "none"
+    value = raw.strip().lower()
+    return "none" if value in ("", "off") else value
 
 
 

@@ -112,13 +112,39 @@ def _guard_line(skill: dict) -> str:
 #   LLM_API_KEY         key for that provider
 #   LLM_MODEL           optional, overrides the provider's default model
 #   LLM_API_BASE        optional, overrides the provider's default endpoint
-#   OPENROUTER_API_KEY  Jev (evidence gathering)
-#   QA_VECTOR_STORE     voyage | qwen — the code-vector store that pre-filters for Jev
+#   JEV_PROVIDER        typesafe | openrouter — where Jev (evidence gathering) is reached;
+#                       unset: typesafe when only TYPESAFE_API_KEY is set, else openrouter
+#   TYPESAFE_API_KEY / OPENROUTER_API_KEY   key of that provider (JEV_API_KEY overrides either)
+#   JEV_MODEL           optional, overrides the provider's default Jev model
+#   JEV_API_BASE        optional, overrides the provider's endpoint
+#   QA_VECTOR_STORE     none | voyage | qwen — the code-vector store that pre-filters for Jev
+#                       (unset: the store whose key is set; none: Jev scores every skill)
 #   VOYAGE_API_KEY / DEEPINFRA_API_KEY   key of that store
+#   GREP_MAX_RESULTS    cap on /api/grep max_results (500)
+#   UB_ALLOW_EMPTY_DB   1 starts without an ingested database (tests)
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.getcwd(), store.DB_FILE_NAME))
 
+
+def _check_db_path(path: str) -> None:
+    """Fail fast on a wrong DB_PATH. store.open would create an empty file,
+    /health would say ok and every question would come back empty.
+    UB_ALLOW_EMPTY_DB=1 skips the check (tests; a service started before
+    the first ingest)."""
+    if os.environ.get("UB_ALLOW_EMPTY_DB") == "1":
+        return
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"❌ DB_PATH={path} does not exist. Ingest the repository first "
+            "(python next_claude.py <repo>) or point DB_PATH at its "
+            f"{store.DB_FILE_NAME}. UB_ALLOW_EMPTY_DB=1 starts without it.")
+
+_check_db_path(DB_PATH)
 _redis_text   = store.open(DB_PATH)
 _redis_binary = _redis_text.binary()
+if os.environ.get("UB_ALLOW_EMPTY_DB") != "1" and not _redis_text.zcard("commit_order"):
+    raise SystemExit(
+        f"❌ DB_PATH={DB_PATH} holds no commits. Ingest the repository first "
+        "(python next_claude.py <repo>). UB_ALLOW_EMPTY_DB=1 starts without it.")
 
 def _redis_clients() -> tuple:
     """(text view, bytes view) of the repository's database file."""
@@ -148,9 +174,11 @@ MIN_SCORE       = 0.35
 
 # ── Code-vector store ─────────────────────────────────────────────────────
 # Chunk vectors of every stored body version (cvec_at:, voyage-code-4 or
-# qwen). Default from env; a request can override via AskRequest.vector_store.
+# qwen). Default from env (QA_VECTOR_STORE; unset: the store whose key is
+# set; "none": no pre-filter, Jev scores every atomic skill); a request can
+# override via AskRequest.vector_store.
 # Per-store score threshold via MIN_SCORE_VOYAGE / MIN_SCORE_QWEN.
-QA_VECTOR_STORE_DEFAULT = os.environ.get("QA_VECTOR_STORE", "voyage")
+QA_VECTOR_STORE_DEFAULT = skills_lib.default_code_store(os.environ.get("QA_VECTOR_STORE"))
 _VECTOR_STORE: contextvars.ContextVar[str] = contextvars.ContextVar(
     "vector_store", default=QA_VECTOR_STORE_DEFAULT)
 
@@ -162,6 +190,10 @@ for _n, _k in (("voyage", "VOYAGE_API_KEY"), ("qwen", "DEEPINFRA_API_KEY")):
 print(f"🧭 code stores loaded: {sorted(CODE_EMBEDDERS) or 'none'} | "
       f"voyage sdk: {skills_lib.VOYAGE_AVAILABLE} | "
       f"VOYAGE_API_KEY set: {bool(os.getenv('VOYAGE_API_KEY'))}")
+if QA_VECTOR_STORE_DEFAULT != "none" and QA_VECTOR_STORE_DEFAULT not in CODE_EMBEDDERS:
+    print(f"⚠️  QA_VECTOR_STORE={QA_VECTOR_STORE_DEFAULT} but its key is unset: the "
+          "pre-filter cannot run, Jev scores every atomic skill (set the key, "
+          "or QA_VECTOR_STORE=none to say so)")
 if _redis_text.vec_tables_to_migrate():
     print("⚠️  the vector tables of this file use the old layout: the embedding search scans "
           "every stored version. Run once to make it fast:\n"
@@ -634,8 +666,133 @@ def _sse_event(payload: dict) -> str:
 
 # ── API Models ─────────────────────────────────────────────────────────────────
 
-JEV_URL = "https://openrouter.ai/api/alpha/decisions"
-JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")   # or cloudflare/clef-flash
+# ── Jev (the judge) ──────────────────────────────────────────────────────────
+# One decisions API, reached directly at Typesafe or through OpenRouter.
+# JEV_PROVIDER picks the provider; unset, it is typesafe when only
+# TYPESAFE_API_KEY is set and openrouter otherwise (upstream behaviour).
+_JEV_PROVIDERS = {
+    "typesafe":   {"url": "https://api.typesafe.ai/v1/systemone",
+                   "key_env": "TYPESAFE_API_KEY",   "model": "jev-1.13.0"},
+    "openrouter": {"url": "https://openrouter.ai/api/alpha/decisions",
+                   "key_env": "OPENROUTER_API_KEY", "model": "typesafe/jev-1.13"},
+}
+# The same model under the other provider's name, so a JEV_MODEL from an old
+# .env keeps working after a switch. jev-latest (Typesafe) has no alias.
+_JEV_MODEL_ALIASES = {
+    "typesafe":   {"typesafe/jev-1.13": "jev-1.13.0"},
+    "openrouter": {"jev-1.13.0": "typesafe/jev-1.13"},
+}
+
+
+def _jev_provider() -> dict:
+    """{name, url, key, key_env, model}, read from the environment on every
+    call. JEV_API_KEY overrides the provider's key, JEV_API_BASE its url,
+    JEV_MODEL its model (alias-mapped between the providers)."""
+    name = (os.environ.get("JEV_PROVIDER") or "").strip().lower()
+    if not name:
+        name = ("typesafe" if os.environ.get("TYPESAFE_API_KEY")
+                and not os.environ.get("OPENROUTER_API_KEY") else "openrouter")
+    if name not in _JEV_PROVIDERS:
+        raise ValueError(f"JEV_PROVIDER={name!r}: expected one of "
+                         f"{', '.join(sorted(_JEV_PROVIDERS))}")
+    spec = _JEV_PROVIDERS[name]
+    model = os.environ.get("JEV_MODEL") or spec["model"]
+    return {"name":    name,
+            "url":     os.environ.get("JEV_API_BASE") or spec["url"],
+            "key":     os.environ.get("JEV_API_KEY") or os.environ.get(spec["key_env"], ""),
+            "key_env": spec["key_env"],
+            "model":   _JEV_MODEL_ALIASES[name].get(model, model)}
+
+
+_jp = _jev_provider()        # an unknown JEV_PROVIDER fails here, at import
+JEV_MODEL = _jp["model"]     # recorded in the reports; the calls read the env each time
+print(f"🧠 Jev: provider={_jp['name']} model={_jp['model']} url={_jp['url']} "
+      f"key={'set' if _jp['key'] else 'MISSING (' + _jp['key_env'] + ')'}")
+
+
+def _jev_key_missing() -> str:
+    """"" when Jev has an API key, else the message for the caller."""
+    prov = _jev_provider()
+    if prov["key"]:
+        return ""
+    return ("Jev needs an API key on the server (Jev gathers the evidence): "
+            f"set {prov['key_env']} for provider {prov['name']}, or JEV_API_KEY. "
+            "TYPESAFE_API_KEY alone selects typesafe, OPENROUTER_API_KEY alone "
+            "selects openrouter; JEV_PROVIDER picks explicitly.")
+
+
+def _jev_client(max_connections: int = 64, timeout: float = 60) -> httpx.Client:
+    """One httpx client for a batch of Jev calls. The caller closes it."""
+    return httpx.Client(
+        timeout=timeout,
+        limits=httpx.Limits(max_connections=max_connections,
+                            max_keepalive_connections=max_connections),
+        headers={"Authorization": f"Bearer {_jev_provider()['key']}"})
+
+
+def _jev_cost(data: dict) -> float:
+    """USD of one call. OpenRouter reports usage.cost; Typesafe reports the
+    tokens only, priced at JEV_PRICE_PER_MTOK_IN per million input tokens."""
+    usage = data.get("usage") or {}
+    if usage.get("cost") is not None:
+        return float(usage.get("cost") or 0)
+    price = float(os.environ.get("JEV_PRICE_PER_MTOK_IN", "0.042"))
+    return float(usage.get("input_tokens") or 0) * price / 1e6
+
+
+def _jev_post(client: httpx.Client, state: dict, questions: dict, *,
+              what: str, attempts: int = 4):
+    """One Jev call with retries. Returns (answers, cost, err): the
+    response's `answers` dict and the cost in USD on success (err None);
+    (None, 0.0, the last error as text) on failure. Retries connection
+    errors, 429, 529 and every 5xx: Retry-After seconds when the response
+    names them (capped at 60), else min(2**attempt, 30); no sleep after the
+    last try. A Typesafe HTTP 400 for max_tokens_exceeded (32k tokens per
+    question) is retried once with the long-context header. `what` names
+    the call in the log lines."""
+    prov = _jev_provider()
+    payload = {"model": prov["model"], "state": state, "questions": questions}
+    headers = None
+    long_ctx = False
+    err = None
+    attempt = 0
+    while attempt < attempts:
+        last = attempt >= attempts - 1
+        try:
+            res = client.post(prov["url"], json=payload, headers=headers)
+        except httpx.HTTPError as e:
+            err = f"{type(e).__name__}: {_scrub(str(e))[:200]}"
+            if not last:
+                time.sleep(min(2 ** attempt, 30))
+            attempt += 1
+            continue
+        if res.status_code == 429 or res.status_code >= 500:
+            err = f"HTTP {res.status_code} {_scrub(res.text[:200])}"
+            if attempt == 0:
+                print(f"⏳ Jev {what} call got HTTP {res.status_code}, retrying")
+            if not last:
+                ra = (res.headers.get("Retry-After") or "").strip()
+                # isdecimal + a length bound: isdigit() also accepts '²' and
+                # thousand-digit runs, which int() rejects with ValueError.
+                time.sleep(min(int(ra), 60) if ra.isdecimal() and len(ra) <= 6
+                           else min(2 ** attempt, 30))
+            attempt += 1
+            continue
+        if (res.status_code == 400 and prov["name"] == "typesafe" and not long_ctx
+                and "max_tokens_exceeded" in res.text):
+            # Typesafe caps a question at 32k tokens unless this header is sent.
+            long_ctx = True
+            headers = {"TypeSafe-Danger-Zone-Long-Context": "true"}
+            print(f"⏳ Jev {what} call: max_tokens_exceeded, retrying with long context")
+            continue                      # not counted as an attempt
+        try:
+            data = res.json()
+        except ValueError:
+            return None, 0.0, f"HTTP {res.status_code}, not JSON: {_scrub(res.text[:200])}"
+        if res.status_code != 200 or not isinstance(data, dict):
+            return None, 0.0, f"HTTP {res.status_code} {_scrub(res.text[:200])}"
+        return (data.get("answers") or {}), _jev_cost(data), None
+    return None, 0.0, err
 
 def _jev_rows_as_of(org_redis, rows: list, to_rank: int) -> list:
     """rows = [(skill_id, current record)]. Keeps the skills that existed at
@@ -723,64 +880,43 @@ def _jev_select(question: str, org_redis,
                 body = skills_lib.get_code(org_redis, dk)
             cands.append({"sid": sid, "sk": sk, "dk": dk, "p": p, "body": body})
 
-    client = httpx.Client(
-        timeout=60,
-        limits=httpx.Limits(max_connections=workers,
-                            max_keepalive_connections=workers),
-        headers={"Authorization":
-                 f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
+    client = _jev_client(max_connections=workers)
 
     def _score(c: dict) -> None:
-        payload = {
-            "model": JEV_MODEL,
-            "state": _strip_desc({
-                "file": c["p"][0], "symbol": c["p"][1],
-                "description": c["sk"].get("description_of_skill", ""),
-                "code": c["body"][:int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))],
-            }),
-            "questions": {"rel": {
-                "type": "score",
-                "instructions": ("How relevant is this piece of code (`code`) "
-                                 "for answering this question about the "
-                                 f"codebase: {question}"
-                                 if _no_desc() else
-                                 "How relevant is this piece of code (`code`, "
-                                 "described in `description`) for answering this "
-                                 f"question about the codebase: {question}"),
-                "criteria": [
-                    "Not relevant: has nothing to do with the question",
-                    "Loosely related: same area of the codebase, but does not help answer the question",
-                    "Relevant: it is part of a mechanism the question asks about",
-                    "Directly relevant: this code itself does what the question asks about",
-                ],
-            }},
-        }
+        state = _strip_desc({
+            "file": c["p"][0], "symbol": c["p"][1],
+            "description": c["sk"].get("description_of_skill", ""),
+            "code": c["body"][:int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))],
+        })
+        questions = {"rel": {
+            "type": "score",
+            "instructions": ("How relevant is this piece of code (`code`) "
+                             "for answering this question about the "
+                             f"codebase: {question}"
+                             if _no_desc() else
+                             "How relevant is this piece of code (`code`, "
+                             "described in `description`) for answering this "
+                             f"question about the codebase: {question}"),
+            "criteria": [
+                "Not relevant: has nothing to do with the question",
+                "Loosely related: same area of the codebase, but does not help answer the question",
+                "Relevant: it is part of a mechanism the question asks about",
+                "Directly relevant: this code itself does what the question asks about",
+            ],
+        }}
         c["score"], c["cost"] = None, 0.0
-        for attempt in range(4):
+        answers, c["cost"], err = _jev_post(client, state, questions, what="select")
+        ans = (answers or {}).get("rel") or {}
+        if err is None and "score" in ans:
             try:
-                res = client.post(JEV_URL, json=payload)
-            except httpx.HTTPError as e:
-                c["err"] = f"{type(e).__name__}: {_scrub(str(e))[:200]}"
-                time.sleep(2 ** attempt)
-                continue
-            if res.status_code == 429 or res.status_code >= 500:
-                if attempt == 0:
-                    print(f"⏳ Jev select call got HTTP {res.status_code}, retrying")
-                time.sleep(2 ** attempt)
-                continue
-            try:
-                data = res.json()
-            except ValueError:
-                c["err"] = f"HTTP {res.status_code}, not JSON: {res.text[:200]}"
-                return
-            ans = (data.get("answers") or {}).get("rel") or {}
-            if res.status_code == 200 and "score" in ans:
-                c.pop("err", None)
                 c["score"] = float(ans["score"])
-                c["cost"] = float((data.get("usage") or {}).get("cost") or 0)
-            else:
-                c["err"] = f"HTTP {res.status_code} {res.text[:200]}"
-            return
+            except (TypeError, ValueError):
+                err = f"score is not a number: {str(ans)[:200]}"
+        if c["score"] is None:
+            # a failure always leaves c["err"] set: info["first_error"] reads it
+            c["err"] = err or f"no score in the answer: {str(ans)[:200]}"
+        else:
+            c.pop("err", None)
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -823,6 +959,7 @@ def _jev_select(question: str, org_redis,
         "kept": len(out), "min_score": min_score,
         "cost": round(sum(c["cost"] for c in cands), 4),
         "secs": round(time.time() - t0, 1),
+        "first_error": _scrub(_errs[0]) if _errs else None,
     }
     return out, info
 
@@ -846,33 +983,13 @@ def _fmt_probs(probs) -> str:
 def _jev_verdict(client, state: dict, instructions: str):
     """One Jev choice call: accept / continue / reject.
     Returns (verdict or None, probability per verdict, cost)."""
-    payload = {"model": JEV_MODEL, "state": state,
-               "questions": {"v": {"type": "choice",
-                                   "instructions": instructions,
-                                   "criteria": _JEV_VERDICTS}}}
-    last_err = None
-    for attempt in range(4):
-        try:
-            res = client.post(JEV_URL, json=payload)
-        except httpx.HTTPError as e:
-            last_err = e
-            time.sleep(2 ** attempt)
-            continue
-        if res.status_code == 429 or res.status_code >= 500:
-            time.sleep(2 ** attempt)
-            continue
-        try:
-            data = res.json()
-        except ValueError:
-            return None, {}, 0.0
-        ans = (data.get("answers") or {}).get("v") or {}
-        if res.status_code == 200 and ans.get("choice") in _JEV_VERDICTS:
-            return (ans["choice"], ans.get("probabilities") or {},
-                    float((data.get("usage") or {}).get("cost") or 0))
-        print(f"⚠️  Jev verdict call failed: HTTP {res.status_code} "
-              f"{_scrub(res.text[:200])}")
-        return None, {}, 0.0
-    print(f"⚠️  Jev verdict gave up after 4 tries ({_scrub(str(last_err))})")
+    questions = {"v": {"type": "choice", "instructions": instructions,
+                       "criteria": _JEV_VERDICTS}}
+    answers, cost, err = _jev_post(client, state, questions, what="verdict")
+    ans = (answers or {}).get("v") or {}
+    if err is None and ans.get("choice") in _JEV_VERDICTS:
+        return ans["choice"], ans.get("probabilities") or {}, cost
+    print(f"⚠️  Jev verdict call failed: {err or 'no verdict in the answer'}")
     return None, {}, 0.0
 
 
@@ -1106,7 +1223,7 @@ def _names_as_choice() -> bool:
     choice question (a distribution over the names plus "none of these")
     instead of one yes/no question per name. Same decision, far fewer
     tokens per call."""
-    return os.environ.get("JEV_NAMES_AS_CHOICE", "0") == "1"
+    return os.environ.get("JEV_NAMES_AS_CHOICE", "1") == "1"
 
 
 def _picked(picks: dict) -> list[str]:
@@ -1161,36 +1278,17 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
                              "platform's copy of the same function helps only if the "
                              "question is about that."),
         }
-    payload = {"model": JEV_MODEL,
-               "state": {**state, "places": "\n\n".join(shown)},
-               "questions": questions}
-    last_err = None
-    for attempt in range(4):
-        try:
-            res = client.post(JEV_URL, json=payload)
-        except httpx.HTTPError as e:
-            last_err = e
-            time.sleep(2 ** attempt)
-            continue
-        if res.status_code == 429 or res.status_code >= 500:
-            time.sleep(2 ** attempt)
-            continue
-        try:
-            data = res.json()
-        except ValueError:
-            return {}, 0.0
-        if res.status_code != 200:
-            print(f"⚠️  Jev triage failed: HTTP {res.status_code} {_scrub(res.text[:200])}")
-            return {}, 0.0
-        answers = data.get("answers") or {}
-        probs = {}
-        for i in range(len(hits)):
-            a = answers.get(f"h{i}") or {}
-            if a.get("noul") is not None:
-                probs[i] = float(a["noul"])
-        return probs, float((data.get("usage") or {}).get("cost") or 0)
-    print(f"⚠️  Jev triage gave up after 4 tries ({_scrub(str(last_err))}); opening every place")
-    return {}, 0.0
+    answers, cost, err = _jev_post(
+        client, {**state, "places": "\n\n".join(shown)}, questions, what="triage")
+    if err is not None:
+        print(f"⚠️  Jev triage failed: {err}; opening every place")
+        return {}, 0.0
+    probs = {}
+    for i in range(len(hits)):
+        a = answers.get(f"h{i}") or {}
+        if a.get("noul") is not None:
+            probs[i] = float(a["noul"])
+    return probs, cost
 
 
 def _jev_verdict_names(client, state: dict, instructions: str,
@@ -1223,43 +1321,22 @@ def _jev_verdict_names(client, state: dict, instructions: str,
                                  "searched next to get closer to answering the "
                                  "`question`?"),
             }
-    payload = {"model": JEV_MODEL, "state": state, "questions": questions}
-    last_err = None
-    for attempt in range(4):
-        try:
-            res = client.post(JEV_URL, json=payload)
-        except httpx.HTTPError as e:
-            last_err = e
-            time.sleep(2 ** attempt)
-            continue
-        if res.status_code == 429 or res.status_code >= 500:
-            if attempt == 0:
-                print(f"⏳ Jev chain call got HTTP {res.status_code}, retrying")
-            time.sleep(2 ** attempt)
-            continue
-        try:
-            data = res.json()
-        except ValueError:
-            return None, {}, 0.0, {}
-        answers = data.get("answers") or {}
-        ans = answers.get("v") or {}
-        if res.status_code == 200 and ans.get("choice") in _JEV_VERDICTS:
-            picks = {}
-            if as_choice:
-                probs = (answers.get("names") or {}).get("probabilities") or {}
-                picks = {n: float(p) for n, p in probs.items()
-                         if n in names or n == _NONE_NAME}
-            else:
-                for i, name in enumerate(names):
-                    a = answers.get(f"n{i}") or {}
-                    if a.get("noul") is not None:
-                        picks[name] = float(a["noul"])
-            return (ans["choice"], ans.get("probabilities") or {},
-                    float((data.get("usage") or {}).get("cost") or 0), picks)
-        print(f"⚠️  Jev verdict call failed: HTTP {res.status_code} "
-              f"{_scrub(res.text[:200])}")
-        return None, {}, 0.0, {}
-    print(f"⚠️  Jev chain call gave up after 4 tries: candidate dropped ({_scrub(str(last_err))})")
+    answers, cost, err = _jev_post(client, state, questions, what="chain")
+    ans = (answers or {}).get("v") or {}
+    if err is None and ans.get("choice") in _JEV_VERDICTS:
+        picks = {}
+        if as_choice:
+            probs = (answers.get("names") or {}).get("probabilities") or {}
+            picks = {n: float(p) for n, p in probs.items()
+                     if n in names or n == _NONE_NAME}
+        else:
+            for i, name in enumerate(names):
+                a = answers.get(f"n{i}") or {}
+                if a.get("noul") is not None:
+                    picks[name] = float(a["noul"])
+        return ans["choice"], ans.get("probabilities") or {}, cost, picks
+    print("⚠️  Jev chain call failed: candidate dropped "
+          f"({err or 'no verdict in the answer'})")
     return None, {}, 0.0, {}
 
 
@@ -1282,7 +1359,6 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     candidate knowing how it was reached; accepted ones are expanded again.
     Stops when nothing new is accepted or the budget is spent.
     Returns (extra skills in _search_skills shape, info)."""
-    min_score = float(os.environ.get("JEV_EXPAND_MIN_SCORE", "2.0"))
     budget    = budget or int(os.environ.get("JEV_EXPAND_BUDGET", "300"))     # Jev calls
     max_add   = max_add or int(os.environ.get("JEV_EXPAND_MAX_ADD", "60"))
     max_chars = int(os.environ.get("JEV_EXPAND_MAX_CHARS", "250000"))
@@ -1544,18 +1620,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                           for x in bl[max(0, c["hit"] - 1): c["hit"] + 2]
                           if x.strip())[:300]
 
-    client = httpx.Client(
-        timeout=60,
-        limits=httpx.Limits(max_connections=256, max_keepalive_connections=256),
-        headers={"Authorization":
-                 f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
+    client = _jev_client(max_connections=256)
     max_hops = int(os.environ.get("JEV_EXPAND_MAX_HOPS", "4"))
     judge_target = memory.target if memory is not None else None
     use_llm_judge = os.environ.get("CHAIN_JUDGE", "jev") == "llm"
-    # Jev takes hundreds of calls at once; the LLM judge keeps the low limit
+    # Jev takes hundreds of calls at once (JEV_CHAIN_CONCURRENCY: the chain
+    # steps; JEV_CONCURRENCY is the select pass); the LLM judge keeps the low limit
     judge_workers = int(os.environ.get("JUDGE_CONCURRENCY", "16")
                         if use_llm_judge
-                        else os.environ.get("JEV_CONCURRENCY", "64"))
+                        else os.environ.get("JEV_CHAIN_CONCURRENCY", "64"))
     tok_in = tok_out = 0
     triage_calls = triage_skipped = 0
     added: list[dict] = []    # accept: the body goes to the context
@@ -1971,7 +2044,7 @@ class AskRequest(BaseModel):
     history: list[dict] = []  # [{"role": "user"|"assistant", "content": str}]
     from_commit: str = ""       # historical QA: window the conversation to a commit range
     to_commit:   str = ""
-    vector_store: Literal["", "voyage", "qwen"] = ""   # "" = env default; the code-vector store that pre-filters for Jev
+    vector_store: Literal["", "none", "voyage", "qwen"] = ""   # "" = env default; the code-vector store that pre-filters for Jev (none: no pre-filter)
 
 
 
@@ -2034,21 +2107,37 @@ async def _gather_evidence(question: str, org_redis, org_redis_binary, as_of,
     #    Jev scores every atomic skill instead (more work, nothing lost).
     _pre_ids = None
     _k = int(os.environ.get("JEV_PREFILTER_TOP_K", "400"))
-    try:
-        _t_search = time.time()
-        _hits = await asyncio.to_thread(
-            lambda: _knn_candidates(question, org_redis_binary,
-                                    embedding=None, top_k=_k,
-                                    include_obsolete=as_of is not None,
-                                    store=_VECTOR_STORE.get(), atomics_only=True,
-                                    as_of=as_of))
-        info["search_secs"] = round(time.time() - _t_search, 2)
-        _pre_ids = [sid for sid, _sc in _hits]
-        _m = (f"Embedding search ({_VECTOR_STORE.get()}) returned "
-              f"{len(_pre_ids)} skills (asked for {_k}).")
-    except Exception as e:
-        _m = (f"Embedding search failed ({_scrub(str(e))[:120]}) — "
-              f"Jev scores every atomic skill instead.")
+    _store = _VECTOR_STORE.get()
+    # the store, how many ids it gave, and whether Jev fell back to every skill
+    info["prefilter"] = {"store": _store, "ids": 0, "fallback": False}
+    if _store == "none":
+        _m = "Pre-filter off (vector store none): Jev scores every atomic skill."
+    else:
+        try:
+            _t_search = time.time()
+            _hits = await asyncio.to_thread(
+                lambda: _knn_candidates(question, org_redis_binary,
+                                        embedding=None, top_k=_k,
+                                        include_obsolete=as_of is not None,
+                                        store=_store, atomics_only=True,
+                                        as_of=as_of))
+            info["search_secs"] = round(time.time() - _t_search, 2)
+            if _hits:
+                _pre_ids = [sid for sid, _sc in _hits]
+                info["prefilter"]["ids"] = len(_pre_ids)
+                _m = (f"Embedding search ({_store}) returned "
+                      f"{len(_pre_ids)} skills (asked for {_k}).")
+            else:
+                # No vectors of this store in this file (or none in the
+                # window): an empty pre-selection would leave Jev nothing.
+                info["prefilter"]["fallback"] = True
+                _m = (f"Embedding search ({_store}) returned no skills — "
+                      "Jev scores every atomic skill instead. Fill the store "
+                      "with: python next_claude.py <repo> --embed-only")
+        except Exception as e:
+            info["prefilter"]["fallback"] = True
+            _m = (f"Embedding search failed ({_scrub(str(e))[:120]}) — "
+                  f"Jev scores every atomic skill instead.")
     print(f"🧭 {_m}")
     yield "status", _m
 
@@ -2058,6 +2147,14 @@ async def _gather_evidence(question: str, org_redis, org_redis_binary, as_of,
         skills, _ji = await asyncio.to_thread(
             _jev_select, question, org_redis, _pre_ids, as_of)
         info["select"] = _ji
+        if _ji["candidates"] and not _ji["scored"]:
+            # Every call failed (wrong key, endpoint down): an empty result
+            # would read as "nothing relevant". api_retrieve maps this to 502.
+            _em = (f"Jev scored none of {_ji['candidates']} candidates: "
+                   f"{_ji.get('first_error') or 'no error recorded'}")
+            print(f"❌ {_em}")
+            yield "error", _em
+            return
         if _pre_ids and skills:
             # Where the kept seeds sat in the embedding ranking: tells whether
             # JEV_PREFILTER_TOP_K can be lowered without losing seeds.
@@ -2189,9 +2286,9 @@ async def _ask_internal_stream(req: AskRequest, max_tokens: int = 27000):
         yield _sse_event({"type": "done"})
         return
 
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        yield _sse_event({"type": "error", "message":
-            "Questions need OPENROUTER_API_KEY on the server (Jev gathers the evidence)."})
+    _jk = _jev_key_missing()
+    if _jk:
+        yield _sse_event({"type": "error", "message": _jk})
         yield _sse_event({"type": "done"})
         return
 
@@ -2564,7 +2661,7 @@ class TimelineReportRequest(BaseModel):
 
 # ── Range report: fan-out probes ──────────────────────────────────────────────
 
-REPORT_CONCURRENCY = min(int(os.environ.get("REPORT_CONCURRENCY", "40")), 20)
+REPORT_CONCURRENCY = min(int(os.environ.get("REPORT_CONCURRENCY", "4")), 20)
 
 _SEV_RANK = {"FLAGRANTLY_MALICIOUS": 7, "SUSPICIOUS": 6, "MAJOR_FLAW": 5,
              "MINOR_FLAW": 4, "FLAW": 4, "ERROR": 3, "INDEX_MISMATCH": 2,
@@ -3636,7 +3733,7 @@ def _commit_slices_block(org_redis, item, commit: str, changed: str,
     total = sum(len(s["text"]) for s in slices)
     picked_by_jev = False
     if total > budget:
-        if os.environ.get("OPENROUTER_API_KEY"):
+        if not _jev_key_missing():
             # Jev reads every other change WHOLE, next to the target's whole
             # changed lines, and says which full diffs the judge needs.
             # Nothing is cut. `room` is what one Jev call can still hold.
@@ -3644,51 +3741,32 @@ def _commit_slices_block(org_redis, item, commit: str, changed: str,
             batch = int(os.environ.get("PROBE_FAST_PICK_BATCH", "40"))
             room = (int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))
                     - len(changed))
-            client = httpx.Client(
-                timeout=60,
-                headers={"Authorization":
-                         f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
+            client = _jev_client()
 
             def _pick(chunk: list[dict]) -> float:
-                payload = {"model": JEV_MODEL, "state": {
+                state = {
                     "stated_goal":   goal or "(none recorded)",
                     "target":        f"`{item.get('symbol')}` in {fp}",
                     "changed_lines": changed,
                     "other_changes": "\n\n".join(
                         f"{i + 1}. {s['loc']} `{s['sym']}`\n{s['text']}"
                         for i, s in enumerate(chunk)),
-                }, "questions": {
+                }
+                questions = {
                     f"n{i}": {"type": "noul", "instructions": (
                         "The same commit also made other change number "
                         f"{i + 1} in `other_changes`. Is its full diff needed "
                         "to judge the change in `changed_lines`?")}
-                    for i in range(len(chunk))}}
-                for attempt in range(4):
-                    try:
-                        res = client.post(JEV_URL, json=payload)
-                    except httpx.HTTPError as e:
-                        if attempt == 3:
-                            print(f"⚠️  Jev diff pick gave up after 4 tries ({_scrub(str(e))})")
-                        time.sleep(2 ** attempt)
-                        continue
-                    if res.status_code == 429 or res.status_code >= 500:
-                        time.sleep(2 ** attempt)
-                        continue
-                    try:
-                        data = res.json()
-                    except ValueError:
-                        return 0.0
-                    if res.status_code != 200:
-                        print(f"⚠️  Jev diff pick failed: HTTP {res.status_code} "
-                              f"{_scrub(res.text[:200])}")
-                        return 0.0
-                    answers = data.get("answers") or {}
-                    for i, s in enumerate(chunk):
-                        a = answers.get(f"n{i}") or {}
-                        if a.get("noul") is not None:
-                            s["want"] = float(a["noul"])
-                    return float((data.get("usage") or {}).get("cost") or 0)
-                return 0.0
+                    for i in range(len(chunk))}
+                answers, cost, err = _jev_post(client, state, questions, what="diff pick")
+                if err is not None:
+                    print(f"⚠️  Jev diff pick failed: {err}")
+                    return 0.0
+                for i, s in enumerate(chunk):
+                    a = answers.get(f"n{i}") or {}
+                    if a.get("noul") is not None:
+                        s["want"] = float(a["noul"])
+                return cost
 
             try:
                 # Whole changes only. A call is filled until the next change
@@ -3827,7 +3905,7 @@ async def _run_probe_fast(question, context, item, diffs, target, org_redis,
                 blocks.append(f"## {tool} `{sym}`\n" + res)
 
         # 3. Jev name chains, started from the changed lines
-        if body and os.environ.get("OPENROUTER_API_KEY"):
+        if body and not _jev_key_missing():
             goal = "; ".join(t.get("goal") or "" for t in touches).strip("; ")
             diff_cap = int(os.environ.get("PROBE_FAST_QUESTION_DIFF_CHARS", "6000"))
             chain_q = (
@@ -4526,10 +4604,9 @@ async def timeline_report(req: TimelineReportRequest):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise HTTPException(status_code=400,
-                            detail="Reports need OPENROUTER_API_KEY on the server "
-                                   "(Jev gathers the evidence).")
+    _jk = _jev_key_missing()
+    if _jk:
+        raise HTTPException(status_code=400, detail=_jk)
     report_id = secrets.token_hex(8)
     await asyncio.to_thread(
         _persist_report_plan, org_redis, report_id,
@@ -5105,8 +5182,9 @@ async def api_retrieve(req: RetrieveRequest):
     Jev scoring → Jev chains. Returns the evidence bodies with coordinates."""
     if not req.question.strip():
         raise HTTPException(400, "question is empty")
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise HTTPException(400, "OPENROUTER_API_KEY is not set (Jev gathers the evidence)")
+    _jk = _jev_key_missing()
+    if _jk:
+        raise HTTPException(400, _jk)
     org_redis, org_redis_binary = _redis_clients()
     as_of, window = None, ""
     if req.from_commit and req.to_commit:
@@ -5142,13 +5220,23 @@ async def api_retrieve(req: RetrieveRequest):
     }
 
 
+GREP_MAX_RESULTS = int(os.environ.get("GREP_MAX_RESULTS", "500"))
+
+
 @app.get("/api/grep")
 async def api_grep(pattern: str, file: str = "", regex: bool = False,
                    max_results: int = 50, include_hist: bool = False,
                    from_commit: str = "", to_commit: str = ""):
-    """Exact substring (or regex) search over every stored body."""
+    """Exact substring (or regex) search over every stored body.
+    max_results is capped at GREP_MAX_RESULTS; a bad regex is a 400."""
     if not pattern:
         raise HTTPException(400, "pattern is empty")
+    if regex:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise HTTPException(400, f"invalid regex: {e}")
+    max_results = max(1, min(max_results, GREP_MAX_RESULTS))
     org_redis, _ = _redis_clients()
     as_of = None
     if from_commit and to_commit:
@@ -5297,7 +5385,7 @@ async def ask_stream(req: AskRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("codebase_qa_service:app", host="127.0.0.1",
+    uvicorn.run(app, host="127.0.0.1",
                 port=int(os.getenv("PORT", "8000")),
                 timeout_graceful_shutdown=2)
     os._exit(0)   # don't wait for worker threads stuck in an LLM call
