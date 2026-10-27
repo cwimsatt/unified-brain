@@ -277,6 +277,10 @@ Measured with the configuration in Part 1 of `env.example`:
   Cursor exploring on its own used 9% of a $20 plan; with unified-brain
   2% plus $0.12 of Jev. `benchmarks/` holds the pre-registered protocol and
   the grading sheet of the comparison set; the results are pending.
+- openscad-rsi (Rust, Python and OpenSCAD; 2,351 symbols) with no embedding
+  pre-filter, Jev direct through Typesafe: $0.13–0.19 of Jev and 34–51 s per
+  question, 0 failed calls, the deciding code in the evidence for all three
+  questions asked — the full numbers are in `benchmarks/openscad-rsi.md`.
 
 Each answer ends with a line of these numbers for your own run. Part 2 of
 `env.example` lists the constants that move them; the ones we tested are
