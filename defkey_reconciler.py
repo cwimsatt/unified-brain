@@ -277,7 +277,8 @@ class DefKeyReconciler:
 
         # NEW: per-file index
         redis.sadd(f"file_symbols:{filepath}", sym_key)
-        redis.sadd(f"symbol_name:{symbol}", sym_key)
+        for nm in skills_lib.symbol_name_keys(symbol):
+            redis.sadd(f"symbol_name:{nm}", sym_key)
 
         if code_body:
             skills_lib.store_code(
@@ -454,8 +455,9 @@ class DefKeyReconciler:
         # NEW: keep per-file index in sync with the rename
         redis.srem(f"file_symbols:{filepath}", old_sym)
         redis.sadd(f"file_symbols:{filepath}", new_sym)
-        redis.srem(f"symbol_name:{symbol}", old_sym)
-        redis.sadd(f"symbol_name:{symbol}", new_sym)
+        for nm in skills_lib.symbol_name_keys(symbol):
+            redis.srem(f"symbol_name:{nm}", old_sym)
+            redis.sadd(f"symbol_name:{nm}", new_sym)
 
         # Latest-version commit for the code_at: copy: read the drifting
         # skills' records BEFORE the index rename. Any one carries it — a

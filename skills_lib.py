@@ -464,6 +464,18 @@ def parse_symbol_key(key: str) -> Optional[tuple[str, str, int, str]]:
         return None
 
 
+def symbol_name_keys(symbol: str) -> list:
+    """The symbol_name: index keys a symbol is listed under: its full name
+    and, for a qualified name (Class.method, tests.helper, Type.new), the
+    bare last component too, so a name as it appears at a call site
+    (`helper()`, `.new()`) resolves to the qualified definition."""
+    out = [symbol]
+    bare = symbol.rsplit(".", 1)[-1] if "." in symbol else ""
+    if bare and bare != symbol:
+        out.append(bare)
+    return out
+
+
 def parse_def_key(def_key: str) -> Optional[tuple[str, str, int, str]]:
     """Parses 'filepath:symbol:line:type'."""
     parts = def_key.rsplit(":", 3)
@@ -1763,7 +1775,8 @@ def obsolete_skill(
         redis.lrem(f"symbol_hist:{def_key}", 0, skill_id)   # idempotent re-obsoletion
         redis.rpush(f"symbol_hist:{def_key}", skill_id)
         if parsed_dk:
-            redis.sadd(f"symbol_name_hist:{parsed_dk[1]}", f"symbol:{def_key}")
+            for nm in symbol_name_keys(parsed_dk[1]):
+                redis.sadd(f"symbol_name_hist:{nm}", f"symbol:{def_key}")
 
         sym_key = f"symbol:{def_key}"
         if redis.exists(sym_key):
@@ -1774,7 +1787,8 @@ def obsolete_skill(
                 if parsed:
                     fp, sym, _, _ = parsed
                     redis.srem(f"file_symbols:{fp}", sym_key)
-                    redis.srem(f"symbol_name:{sym}", sym_key)
+                    for nm in symbol_name_keys(sym):
+                        redis.srem(f"symbol_name:{nm}", sym_key)
         # Symbol position fully dead (index entry gone or never existed)
         # → its outgoing call edges leave current state. called_by:<name>
         # survives — that's the obsoleted-but-still-called flag.

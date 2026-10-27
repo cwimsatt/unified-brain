@@ -116,6 +116,23 @@ def test_call_edges(ingested_db):
     assert f_ in r.smembers("called_by:area")
 
 
+def test_symbol_name_index_lists_qualified_names_under_their_bare_name(ingested_db):
+    """Counter.inc is reachable as `inc` (the name at a call site) and as
+    Counter.inc; a bare name stays listed once under itself."""
+    r = ingested_db.r
+    keys = _def_keys(r)
+    inc = _find(keys, "src/lib.rs", "Counter.inc", "method")
+    helper = _find(keys, "src/lib.rs", "helper", "function")
+    dec = lambda xs: {x.decode() if isinstance(x, bytes) else x for x in xs}
+    assert f"symbol:{inc}" in dec(r.smembers("symbol_name:inc"))
+    assert f"symbol:{inc}" in dec(r.smembers("symbol_name:Counter.inc"))
+    assert f"symbol:{helper}" in dec(r.smembers("symbol_name:helper"))
+    assert skills_lib.symbol_name_keys("Counter.inc") == ["Counter.inc", "inc"]
+    assert skills_lib.symbol_name_keys("tests.near_equal_verdict") == ["tests.near_equal_verdict", "near_equal_verdict"]
+    assert skills_lib.symbol_name_keys("helper") == ["helper"]
+    assert skills_lib.symbol_name_keys("<module>") == ["<module>"]
+
+
 def test_edit_keeps_history(ingested_db):
     """Commit 3 edits hello: the live body is the new one, the per-commit
     copy of commit 1 still holds the old text, and the skill is updated,

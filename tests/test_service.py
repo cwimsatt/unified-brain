@@ -377,3 +377,14 @@ def test_jev_post_long_context_retry_on_typesafe(service, monkeypatch, no_sleep)
     c = _Client([_Resp(400, {"error": "max_tokens_exceeded"})])
     assert service._jev_post(c, {}, {}, what="t")[2].startswith("HTTP 400")
     assert len(c.posts) == 1 and no_sleep == []
+
+
+# ── /api/symbol ──────────────────────────────────────────────────────────────
+
+def test_api_symbol_resolves_a_method_by_its_bare_name(client):
+    d = client.get("/api/symbol/inc").json()
+    assert [x["symbol"] for x in d["definitions"]] == ["Counter.inc"]
+    assert d["definitions"][0]["file"] == "src/lib.rs" and d["definitions"][0]["has_body"]
+    full = client.get("/api/symbol/Counter.inc").json()
+    assert [x["symbol"] for x in full["definitions"]] == ["Counter.inc"]
+    assert {c["symbol"] for c in client.get("/api/symbol/helper").json()["callers"]} == {"Counter.inc"}
