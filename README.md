@@ -105,10 +105,13 @@ No LLM is used during ingestion. One embedding pass runs at the end.
 ## Requirements
 
 - Python 3.11 or newer (SQLite comes with it; nothing else to install or run)
-- API keys: [OpenRouter](https://openrouter.ai) (Jev), one embedding provider —
+- API keys: Jev, directly from [Typesafe](https://typesafe.ai) or through
+  [OpenRouter](https://openrouter.ai); one writer provider ([Fireworks](https://fireworks.ai)
+  for DeepSeek, or Anthropic); and, optionally, one embedding provider —
   [Voyage AI](https://www.voyageai.com) or [DeepInfra](https://deepinfra.com)
-  (Qwen3-Embedding-8B, cheaper) — and one writer provider ([Fireworks](https://fireworks.ai)
-  for DeepSeek, or Anthropic).
+  (Qwen3-Embedding-8B, cheaper). Without one, set `CODE_EMBED_PASS2=none` and
+  `QA_VECTOR_STORE=none`: the ingest skips the embedding pass and Jev scores
+  every symbol of the repository for each question instead of the nearest 400.
 
 ## Quick start
 
@@ -135,9 +138,11 @@ DB_PATH=/Users/you/code/xz/.unified-brain.db
 # writer: llmbase = DeepSeek V4.1 Flash on Fireworks, or anthropic
 LLM_PROVIDER=llmbase
 LLM_API_KEY=...
-# Jev, through OpenRouter
-OPENROUTER_API_KEY=...
-# code embeddings: qwen (the benchmarks), or voyage (then set VOYAGE_API_KEY instead)
+# Jev: directly at Typesafe, or JEV_PROVIDER=openrouter with OPENROUTER_API_KEY
+JEV_PROVIDER=typesafe
+TYPESAFE_API_KEY=...
+# code embeddings: qwen (the benchmarks), voyage (then VOYAGE_API_KEY instead),
+# or none (no key; Jev scores every symbol)
 CODE_EMBED_PASS2=qwen
 QA_VECTOR_STORE=qwen
 DEEPINFRA_API_KEY=...
@@ -270,18 +275,29 @@ Measured with the configuration in Part 1 of `env.example`:
 - Vague questions ("what is this library for?") are cheaper on Jev.
 - One comparison so far, same question, same Cursor model, caches cold:
   Cursor exploring on its own used 9% of a $20 plan; with unified-brain
-  2% plus $0.12 of Jev. The answers are in `benchmarks/`.
+  2% plus $0.12 of Jev. `benchmarks/` holds the pre-registered protocol and
+  the grading sheet of the comparison set; the results are pending.
 
 Each answer ends with a line of these numbers for your own run. Part 2 of
 `env.example` lists the constants that move them; the ones we tested are
 noted there.
+
+### Tests
+
+```bash
+pip install pytest && pytest -q
+```
+
+The tests build a three-commit repository in a temporary folder, ingest it
+and start the service with Jev mocked; no key and no network are needed. CI
+runs them on Python 3.11 and 3.13 on every push and pull request.
 
 ## How it is built
 
 | File | Role |
 |---|---|
 | `next_claude.py` | the `ingest` command: git history → the database file, then the embedding pass |
-| `ingester.py` | reads commits and extracts symbols with tree-sitter (C, C++, Python, TypeScript, JavaScript, shell, CMake, make, YAML; m4, assembly and automake by regex) |
+| `ingester.py` | reads commits and extracts symbols with tree-sitter (C, C++, Python, TypeScript, JavaScript, Rust, OpenSCAD, shell, CMake, YAML; assembly by regex; make, m4 and automake stored whole-file) |
 | `defkey_reconciler.py` | keeps the symbol index right as lines move, symbols change or disappear |
 | `store.py` | the database: one SQLite file, with the text index for grep and the vector tables |
 | `skills_lib.py` | the record layer: skills, bodies per commit, edges, code vectors, grep |
@@ -289,6 +305,19 @@ noted there.
 | `codebase_qa_service.py` | the FastAPI service: questions, timeline, reports, evidence |
 | `templates.py` | the two pages |
 | `unified_brain_mcp.py` | the MCP server for coding agents: one tool, `retrieve` (a thin client of the service) |
+
+## Known limitations
+
+- The service has no authentication and answers any origin (CORS `*`). It
+  listens on localhost only; do not expose the port — every question costs
+  money.
+- `store.py` is a Redis-like API over one SQLite file. Its lease and counter
+  operations (`set nx`, `incr`, `hincrbyfloat`) are read-then-write, not
+  atomic, and the service and the ingester should not write the same database
+  file at the same time: stop the service before ingesting into its database.
+- The pages insert model output into the HTML unsanitized (the answer through
+  `marked.parse`; the timeline inserts several fields unescaped). Fine on your
+  own machine; one more reason not to expose the port.
 
 ## Licence
 
