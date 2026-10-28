@@ -1625,10 +1625,13 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     judge_target = memory.target if memory is not None else None
     use_llm_judge = os.environ.get("CHAIN_JUDGE", "jev") == "llm"
     # Jev takes hundreds of calls at once (JEV_CHAIN_CONCURRENCY: the chain
-    # steps; JEV_CONCURRENCY is the select pass); the LLM judge keeps the low limit
+    # steps; JEV_CONCURRENCY is the select pass, and the chain's limit too
+    # when JEV_CHAIN_CONCURRENCY is unset, as before the two were split);
+    # the LLM judge keeps the low limit
     judge_workers = int(os.environ.get("JUDGE_CONCURRENCY", "16")
                         if use_llm_judge
-                        else os.environ.get("JEV_CHAIN_CONCURRENCY", "64"))
+                        else os.environ.get("JEV_CHAIN_CONCURRENCY")
+                        or os.environ.get("JEV_CONCURRENCY", "64"))
     tok_in = tok_out = 0
     triage_calls = triage_skipped = 0
     added: list[dict] = []    # accept: the body goes to the context

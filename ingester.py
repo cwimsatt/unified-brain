@@ -121,6 +121,7 @@ BINARY_MAGIC = {
 }
 
 _PARSERS = {}
+_GRAMMAR_FAILED = set()
 
 
 def log_phase(phase, status, **extra):
@@ -132,6 +133,17 @@ def _parser(lang):
     if lang not in _PARSERS:
         _PARSERS[lang] = get_parser(lang)
     return _PARSERS[lang]
+
+
+def _grammar_missing(lang, err):
+    """Logged once per language. The grammars are fetched from github.com
+    on first use (or by the `prefetch` command); without them every file of
+    the language is stored whole, which a long ingest would otherwise hide."""
+    if lang in _GRAMMAR_FAILED:
+        return
+    _GRAMMAR_FAILED.add(lang)
+    log_phase('resolve', 'NO_GRAMMAR', lang=lang, error=str(err)[:200],
+              hint='python ingester.py <repo> prefetch')
 
 
 def _text(node, src):
@@ -1895,7 +1907,8 @@ def resolve_language(file_path, content):
             try:
                 tree = _parser(cand).parse(src)
                 ratio = _error_ratio(tree)
-            except Exception:
+            except Exception as e:
+                _grammar_missing(cand, e)
                 continue
             if ratio < best_ratio:
                 best, best_ratio, best_tree = cand, ratio, tree
@@ -1906,7 +1919,8 @@ def resolve_language(file_path, content):
     try:
         tree = _parser(lang).parse(src)
         ratio = _error_ratio(tree)
-    except Exception:
+    except Exception as e:
+        _grammar_missing(lang, e)
         return 'text', 3, None      # grammar missing/broken → still covered
     if ratio > MAX_ERROR_RATIO:
         log_phase('resolve', 'DEMOTE', file=os.path.basename(file_path),

@@ -11,4 +11,5 @@ venv/
 dump.rdb
 .DS_Store
 .idea/
-.vscode/.pytest_cache/
+.vscode/
+.pytest_cache/

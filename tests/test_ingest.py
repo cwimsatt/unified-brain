@@ -133,6 +133,44 @@ def test_symbol_name_index_lists_qualified_names_under_their_bare_name(ingested_
     assert skills_lib.symbol_name_keys("<module>") == ["<module>"]
 
 
+def test_same_position_sids_does_not_follow_the_bare_name_alias(ingested_db):
+    """symbol_name:inc lists Counter.inc too. A drifted address of a free
+    function `inc` in the same file must resolve to inc's own history, not
+    to Counter.inc's; a drifted Counter.inc still resolves to itself."""
+    r = ingested_db.r
+    keys = _def_keys(r)
+    inc = _find(keys, "src/lib.rs", "Counter.inc", "method")
+    free, sid = "symbol:src/lib.rs:inc:40:function", "sid-free-inc"
+    try:
+        r.sadd("symbol_name:inc", free)
+        r.rpush(free, sid)
+        assert skills_lib._same_position_sids(r, "src/lib.rs:inc:50:function") == [sid]
+        drifted = inc.replace(f":{keys[inc][2]}:", ":999:")
+        sids = skills_lib._same_position_sids(r, drifted)
+        assert sids and sid not in sids
+    finally:
+        r.srem("symbol_name:inc", free)
+        r.delete(free)
+
+
+def test_reindex_symbol_name_aliases_upgrades_a_pre_alias_database(ingested_db):
+    """A database written before the bare-name alias (simulated by removing
+    the alias and the marker) gets it back from the one-off reindex; the
+    marker makes the next call a no-op."""
+    r = ingested_db.r
+    keys = _def_keys(r)
+    inc = f"symbol:{_find(keys, 'src/lib.rs', 'Counter.inc', 'method')}"
+    dec = lambda xs: {x.decode() if isinstance(x, bytes) else x for x in xs}
+    r.delete(skills_lib._SYMBOL_NAME_ALIAS_MARK)
+    r.srem("symbol_name:inc", inc)
+    assert inc not in dec(r.smembers("symbol_name:inc"))
+    assert skills_lib.reindex_symbol_name_aliases(r) >= 1
+    assert inc in dec(r.smembers("symbol_name:inc"))
+    assert inc in dec(r.smembers("symbol_name:Counter.inc"))
+    assert r.get(skills_lib._SYMBOL_NAME_ALIAS_MARK)
+    assert skills_lib.reindex_symbol_name_aliases(r) == 0
+
+
 def test_edit_keeps_history(ingested_db):
     """Commit 3 edits hello: the live body is the new one, the per-commit
     copy of commit 1 still holds the old text, and the skill is updated,

@@ -476,6 +476,30 @@ def symbol_name_keys(symbol: str) -> list:
     return out
 
 
+_SYMBOL_NAME_ALIAS_MARK = "symbol_name_alias_v"
+
+
+def reindex_symbol_name_aliases(redis) -> int:
+    """One-off upgrade of a database written before qualified symbols were
+    listed under their bare name (symbol_name_keys): every entry of
+    symbol_name:<Type.method> (and of the symbol_name_hist: index) is added
+    under symbol_name:<method> too. A marker key makes later calls one GET.
+    Returns the number of entries added."""
+    if redis.get(_SYMBOL_NAME_ALIAS_MARK):
+        return 0
+    added = 0
+    for prefix in ("symbol_name:", "symbol_name_hist:"):
+        for key in list(redis.scan_iter(f"{prefix}*")):
+            key = key.decode() if isinstance(key, bytes) else key
+            names = symbol_name_keys(key[len(prefix):])
+            members = list(redis.smembers(key) or ()) if len(names) > 1 else []
+            for nm in names[1:]:
+                if members:
+                    added += int(redis.sadd(f"{prefix}{nm}", *members) or 0)
+    redis.set(_SYMBOL_NAME_ALIAS_MARK, "1")
+    return added
+
+
 def parse_def_key(def_key: str) -> Optional[tuple[str, str, int, str]]:
     """Parses 'filepath:symbol:line:type'."""
     parts = def_key.rsplit(":", 3)
@@ -1202,8 +1226,8 @@ def _same_position_sids(redis, def_key):
     for k in keys:
         k = k.decode() if isinstance(k, bytes) else k
         pk = parse_symbol_key(k)
-        if not pk or pk[0] != fp:
-            continue
+        if not pk or pk[0] != fp or pk[1] != sym:
+            continue                 # symbol_name:<bare> also lists Type.<bare>
         alt = f"{pk[0]}:{pk[1]}:{pk[2]}:{pk[3]}"
         if alt == def_key:
             continue

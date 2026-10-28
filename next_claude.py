@@ -382,6 +382,10 @@ def main() -> None:
     db_path = _arg("--db") or store.db_path_for_repo(repo_path)
     r, rb = _db_clients(db_path)
     print(f"📁 database: {db_path}")
+    n_alias = skills_lib.reindex_symbol_name_aliases(r)   # pre-alias database: one-off
+    if n_alias:
+        print(f"🔁 symbol index upgraded: {n_alias} qualified name(s) now listed "
+              "under their bare name too")
 
     t0 = time.time()
     failed_commits = failed_batches = 0

@@ -33,6 +33,17 @@ def test_rust_resolves_to_tier1_grammar():
     assert "rust" in ingester.TIER1 and "rust" in ingester._TIER1_EXTRACTORS
 
 
+def test_missing_grammar_demotes_to_whole_file_and_logs_once(monkeypatch, capsys):
+    def boom(lang):
+        raise RuntimeError("no grammar")
+    monkeypatch.setattr(ingester, "_parser", boom)
+    monkeypatch.setattr(ingester, "_GRAMMAR_FAILED", set())
+    assert ingester.resolve_language("a.rs", "fn main() {}")[:2] == ("text", 3)
+    assert ingester.resolve_language("b.rs", "fn main() {}")[:2] == ("text", 3)
+    err = capsys.readouterr().err
+    assert err.count("NO_GRAMMAR") == 1 and "prefetch" in err
+
+
 def test_rust_symbols():
     syms = _by_name(ingester.extract_symbols(RS, "src/lib.rs"))
     assert ("Counter", "struct") in syms

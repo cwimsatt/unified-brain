@@ -104,7 +104,11 @@ No LLM is used during ingestion. One embedding pass runs at the end.
 
 ## Requirements
 
-- Python 3.11 or newer (SQLite comes with it; nothing else to install or run)
+- Python 3.11 or newer (SQLite comes with it; nothing else to install or run).
+  The tree-sitter grammars (about 16 MB) are fetched from github.com on the
+  first parse and cached under `~/.cache/tree-sitter-language-pack`;
+  `python ingester.py <repo> prefetch` fetches them up front (behind a proxy,
+  or before going offline).
 - API keys: Jev, directly from [Typesafe](https://typesafe.ai) or through
   [OpenRouter](https://openrouter.ai); one writer provider ([Fireworks](https://fireworks.ai)
   for DeepSeek, or Anthropic); and, optionally, one embedding provider —
@@ -129,8 +133,9 @@ pip install -r requirements.txt
 cp env.example .env
 ```
 
-Open `.env` and fill in Part 1. The minimum (comments only on their own
-lines — python-dotenv reads `KEY=value  # text` as the value `# text`):
+Open `.env` and fill in Part 1. The minimum (comments go on their own lines
+or after a value and a space, never after an empty value — python-dotenv
+reads `KEY=   # text` as the value `# text`):
 
 ```
 # the database the service answers about (written by step 2)
@@ -199,7 +204,15 @@ Stopped half-way (Ctrl+C, sleep, crash)? Continue from the last ingested commit:
 python next_claude.py ~/code/xz --resume
 ```
 
+Run it once after upgrading unified-brain, too: a database written by an
+older version gets its symbol index brought up to date first (qualified
+names such as `Counter.inc` are now listed under `inc` as well).
+
 To start over, delete the `.unified-brain.db` file.
+
+The command exits 1 when a commit or an embedding batch failed, or when
+`CODE_EMBED_PASS2` names a store whose key is missing (no vectors were
+written); with no embedding key, set `CODE_EMBED_PASS2=none`.
 
 ### 4. Embeddings (only if you need to redo them)
 
@@ -280,7 +293,9 @@ Measured with the configuration in Part 1 of `env.example`:
 - openscad-rsi (Rust, Python and OpenSCAD; 2,351 symbols) with no embedding
   pre-filter, Jev direct through Typesafe: $0.13–0.19 of Jev and 34–51 s per
   question, 0 failed calls, the deciding code in the evidence for all three
-  questions asked — the full numbers are in `benchmarks/openscad-rsi.md`.
+  questions asked (11 of the 12 hand-located definitions; one parallel test
+  change missed on question 2) — the full numbers are in
+  `benchmarks/openscad-rsi.md`.
 
 Each answer ends with a line of these numbers for your own run. Part 2 of
 `env.example` lists the constants that move them; the ones we tested are
@@ -293,8 +308,10 @@ pip install pytest && pytest -q
 ```
 
 The tests build a three-commit repository in a temporary folder, ingest it
-and start the service with Jev mocked; no key and no network are needed. CI
-runs them on Python 3.11 and 3.13 on every push and pull request.
+and start the service with Jev mocked; no key is needed, and no network once
+the tree-sitter grammars are cached (the first run fetches them from
+github.com, see Requirements). CI runs them on Python 3.11 and 3.13 on every
+push and pull request.
 
 ## How it is built
 
@@ -322,6 +339,13 @@ runs them on Python 3.11 and 3.13 on every push and pull request.
 - The pages insert model output into the HTML unsanitized (the answer through
   `marked.parse`; the timeline inserts several fields unescaped). Fine on your
   own machine; one more reason not to expose the port.
+- `requirements.txt` pins some packages exactly and others with a lower
+  bound; there is no lockfile. The tree-sitter grammars are not bundled with
+  `tree-sitter-language-pack`: they are downloaded from github.com on first
+  use (or by `python ingester.py <repo> prefetch`) and cached under
+  `~/.cache/tree-sitter-language-pack`. Without that cache and without
+  network, every `.py`, `.rs`, `.c`… file is stored whole instead of symbol
+  by symbol; the ingest logs `NO_GRAMMAR` once per language on stderr.
 
 ## Licence
 
