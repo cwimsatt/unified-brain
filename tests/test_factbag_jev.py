@@ -229,7 +229,8 @@ def test_resolver_retracts_superseded_passages_only(claims):
     state, questions = job.request()
     assert state == {"documents": [{"text": P1.text}, {"text": P2.text}], "candidate": {"fields": {}}}
     assert questions["passage_1"]["criteria"] == STANDING_CRITERIA
-    assert "judge documents[1] only" in questions["passage_1"]["instructions"]["task"]
+    assert "Judge documents[1] only" in questions["passage_1"]["instructions"]["task"]
+    assert "not retracted for denying the fact" in questions["passage_1"]["instructions"]["task"]
     post = scripted([{"passage_0": {"choice": "KEEP", "probabilities": {"KEEP": 0.8, "RETRACT": 0.2}},
                       "passage_1": {"choice": "RETRACT", "probabilities": {"KEEP": 0.3, "RETRACT": 0.7}}}])
     (res,) = [r for _j, r in [(j, j.execute(post)) for j in run.jobs]]

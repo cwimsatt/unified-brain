@@ -304,7 +304,10 @@ Jev `cost_usd`, and an `id`. `GET /api/claims/{id}` returns it again;
 `POST /api/claims/{id}/retract` with `{"literal_ids": [...]}` removes evidence
 by hand (the ids are in the proof tree) and queries again without a Jev call;
 `POST /api/claims/{id}/resolve` asks Jev to settle conflicted claims by reading
-the disagreeing passages together and retracting the superseded ones.
+the disagreeing passages together and retracting the superseded ones (the
+question's wording differs from Factbag's: on six synthetic pairs Jev 1.13
+got 1 right with Factbag's wording and 6 with ours; `python
+scripts/claims_resolver_eval.py` reruns the comparison).
 `GET /api/claims` lists past evaluations. Evidence comes from the question's
 retrieval, or from explicit `skill_ids`. A claim may carry `params`
 (`{"year": [2024, 2025]}`), which makes one candidate per value; a formula is

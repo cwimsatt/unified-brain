@@ -61,12 +61,11 @@ def test_jev_resolves_a_superseded_passage():
     assert results[0][1] is None, results
     res = run.jobs[0].result
     print("\nlive resolver:", [(r["source"], r["answer"]["probabilities"]) for r in res["retracted"] + res["kept"]])
-    # The superseded January passage must go. What Jev makes of the March
-    # passage is its call: on 2026-10-28 it retracted that one too (0.97),
-    # reading "not 100" as a withdrawal of the fact, which leaves the claim
-    # unknown rather than false. Either way the conflict is settled.
-    assert old.id in [r["source"] for r in res["retracted"]]
-    assert query(run.kb, limit()).value in ("false", "unknown")
+    # The superseded January passage goes, the March one stays, so the claim
+    # is false. (With Factbag's original wording Jev retracted both on
+    # 2026-10-28; see scripts/claims_resolver_eval.py.)
+    assert [r["source"] for r in res["retracted"]] == [old.id]
+    assert query(run.kb, limit()).value == "false"
     assert run.cost > 0
 
 

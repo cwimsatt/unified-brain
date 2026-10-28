@@ -11,8 +11,10 @@ licensed under the Apache License, Version 2.0
   < true), the evidence and rule combination of `evaluateGroundAtom`, open-
   and closed-world absence, negation as failure, and the proof tree.
 - factbag_jev.py: the classification task text and the ASSERT / DENY /
-  IRRELEVANT criteria, the admission rule, the KEEP / RETRACT resolver and its
-  criteria, the passage id format and the recursive chunker.
+  IRRELEVANT criteria, the admission rule, the KEEP / RETRACT resolver (its
+  question wording was rewritten after evaluation; the original is kept in
+  scripts/claims_resolver_eval.py), the passage id format and the recursive
+  chunker.
 
 The port is a re-implementation in Python, not a copy of the TypeScript
 source; the Apache-2.0 licence of the original applies to the parts derived
