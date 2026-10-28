@@ -500,6 +500,68 @@ def reindex_symbol_name_aliases(redis) -> int:
     return added
 
 
+def call_edges_among(redis, def_keys: list, to_rank: Optional[int] = None) -> list:
+    """The call edges whose caller and callee are both in `def_keys`:
+    [{caller, callee, name, line, commit}]. Callees are stored by the bare
+    name written at the call site (`helper`, `inc`), so a callee name is
+    matched against every def_key's names (symbol_name_keys); one name
+    defined twice gives an edge to each definition. With `to_rank`, edges
+    introduced after that commit or removed by it are left out (calls_hist:
+    is read as well)."""
+    keys = [dk for dk in dict.fromkeys(def_keys) if parse_def_key(dk)]
+    by_name: dict = {}
+    for dk in keys:
+        for n in symbol_name_keys(parse_def_key(dk)[1]):
+            by_name.setdefault(n, []).append(dk)
+    prefixes = ["calls"] + (["calls_hist"] if to_rank is not None else [])
+    pipe = redis.pipeline(transaction=False)
+    for dk in keys:
+        for pre in prefixes:
+            pipe.hgetall(f"{pre}:{dk}")
+    hashes = pipe.execute()
+    ranks: dict = {}
+
+    def rank(commit: str):
+        if not commit:
+            return None
+        if commit not in ranks:
+            ranks[commit] = redis.zrank("commit_order", commit)
+        return ranks[commit]
+
+    out, seen = [], set()
+    i = 0
+    for dk in keys:
+        for _pre in prefixes:
+            h = hashes[i] or {}
+            i += 1
+            for field, v in h.items():
+                field = field.decode() if isinstance(field, bytes) else field
+                v = v.decode() if isinstance(v, bytes) else v
+                name, _, line = field.rpartition(":")
+                try:
+                    rec = json.loads(v)
+                except (json.JSONDecodeError, TypeError):
+                    rec = {}
+                if to_rank is not None:
+                    r_in = rank(rec.get("commit") or "")
+                    if r_in is not None and int(r_in) > to_rank:
+                        continue
+                    r_out = rank(rec.get("removed") or "")
+                    if r_out is not None and int(r_out) <= to_rank:
+                        continue
+                for tgt in by_name.get(name, []):
+                    if tgt == dk:
+                        continue
+                    k = (dk, tgt, line)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append({"caller": dk, "callee": tgt, "name": name,
+                                "line": int(line) if line.isdigit() else 0,
+                                "commit": rec.get("commit") or ""})
+    return out
+
+
 def parse_def_key(def_key: str) -> Optional[tuple[str, str, int, str]]:
     """Parses 'filepath:symbol:line:type'."""
     parts = def_key.rsplit(":", 3)

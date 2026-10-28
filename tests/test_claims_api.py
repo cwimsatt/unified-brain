@@ -255,3 +255,78 @@ def test_per_symbol_errors(client, jev_mock):
         res = _evaluate(client, claims=claims, rules=rules)
         assert res.status_code == 400 and msg in res.json()["detail"], (msg, res.text)
     assert jev_mock.calls == []
+
+
+# ── call edges as facts ─────────────────────────────────────────────────────
+
+REACHES = {"head": {"predicate": "reaches", "world": "closed",
+                    "fields": {"src": {"var": "X"}, "dst": {"var": "Z"}}},
+           "iff": {"or": [{"atom": {"predicate": "calls", "fields": {"caller": {"var": "X"}, "callee": {"var": "Z"}}}},
+                          {"and": [{"atom": {"predicate": "calls", "fields": {"caller": {"var": "X"}, "callee": {"var": "Y"}}}},
+                                   {"atom": {"predicate": "reaches", "fields": {"src": {"var": "Y"}, "dst": {"var": "Z"}}}}]}]}}
+HAS_CALLEE = {"head": {"predicate": "has_callee", "fields": {"symbol": {"var": "S"}}, "world": "closed"},
+              "iff": {"atom": {"predicate": "calls", "fields": {"caller": {"var": "S"}, "callee": {"var": "Y"}}}}}
+
+
+def test_call_edges_among_the_fixture_symbols(ingested_db, service):
+    import skills_lib
+    r = ingested_db.r
+    dks = sorted(json.loads(r.get(f"skill:{s}"))["def_key"] for s in r.smembers("skills_active"))
+    edges = skills_lib.call_edges_among(r, dks)
+    short = sorted((e["caller"].split(":")[1], e["callee"].split(":")[1], e["name"]) for e in edges)
+    assert short == [("Counter.inc", "helper", "helper"), ("f", "area", "area"), ("greet", "hello", "hello")]
+    assert all(e["line"] > 0 and len(e["commit"]) == 40 for e in edges)
+    # a window at the first commit keeps only the python edge
+    assert [e["name"] for e in skills_lib.call_edges_among(r, dks, to_rank=0)] == ["hello"]
+    assert skills_lib.call_edges_among(r, ["not:a:def:key", "x"]) == []
+
+
+def test_import_calls_and_follow_the_graph(client, jev_mock):
+    jev_mock.relevant = {"hello", "greet", "Counter.inc", "helper"}
+    jev_mock.claims = {"prints": {"assert": ["println"]}}
+    claims = [{"name": "prints", "description": "The function prints.", "scope": "symbol"}]
+    res = _evaluate(client, question="what calls what?", claims=claims, rules=[REACHES, HAS_CALLEE],
+                    import_facts=["calls"])
+    assert res.status_code == 200, res.text
+    d = res.json()
+    facts = d["info"]["facts"]
+    assert facts["nodes"] == 4 and sorted(e["callee"].split(":")[1] for e in facts["calls"]) == ["hello", "helper"]
+    j = d["judgments"]
+    assert {r["symbol"]: r["value"] for r in j["has_callee"]["by_symbol"]} == {
+        "hello": "false", "greet": "true", "Counter.inc": "true", "helper": "false"}
+    reach = {(r["atom"]): r["value"] for r in j["reaches"]["by_symbol"]}
+    by = {k.split("symbol:")[1].split(":")[1] + "->" + k.split("symbol:")[2].split(":")[1]: v for k, v in reach.items()}
+    assert by["greet->hello"] == "true" and by["Counter.inc->helper"] == "true"
+    # 4 x 4 minus the pairs naming one symbol twice, which candidates() drops (Factbag)
+    assert by["greet->helper"] == "false" and by["hello->greet"] == "false" and len(by) == 12
+    assert j["reaches"]["summary"] == {"false": 10, "unknown": 0, "conflicted": 0, "true": 2}
+    # the facts are never classified: Jev saw one claim per passage, nothing about calls
+    calls = [c for c in jev_mock.calls if c["what"] == "claims"]
+    assert len(calls) == 4 and {c["questions"]["candidate_0"]["instructions"]["predicate"]["name"] for c in calls} == {"prints"}
+    src = next(r for r in j["has_callee"]["by_symbol"] if r["symbol"] == "greet")["explanation"]
+    assert "index:calls@" in json.dumps(src)
+    assert d["import_facts"] == ["calls"] and client.get(f"/api/claims/{d['id']}").json()["judgments"] == j
+    # errors
+    assert "import_facts" in _evaluate(client, claims=claims, import_facts=["refs"]).json()["detail"]
+    assert "index fact" in _evaluate(client, claims=[{"name": "calls", "description": "d"}],
+                                     import_facts=["calls"]).json()["detail"]
+    assert "world is open or closed" in _evaluate(
+        client, claims=claims, rules=[{"head": {"predicate": "h", "world": "maybe"}, "if": "prints"}]).json()["detail"]
+
+
+def test_qualified_symbols_find_their_callers(client, service, ingested_db):
+    """Call sites name the bare method (`inc()`), so callers of `Counter.inc`
+    live under called_by:inc; the lookups now follow every name."""
+    r = ingested_db.r
+    caller = "src/main.rs:main:1:function"
+    r.sadd("called_by:inc", caller)
+    r.hset(f"calls:{caller}", "inc:3", json.dumps({"snippet": "c.inc();", "commit": "deadbeef"}))
+    try:
+        d = client.get("/api/symbol/Counter.inc").json()
+        assert [c["symbol"] for c in d["callers"]] == ["main"]
+        text = service._callers_text("Counter.inc", r)
+        assert "src/main.rs:main:1:function" in text and "c.inc();" in text
+        assert "No callers" in service._callers_text("Counter", r)
+    finally:
+        r.srem("called_by:inc", caller)
+        r.delete(f"calls:{caller}")

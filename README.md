@@ -324,7 +324,21 @@ does the same with `per_symbol=true`. Rules then take variables:
                  {"not": {"atom": {"predicate": "logs_secret", "fields": {"symbol": {"var": "S"}}}}}]}}
 ```
 
-A new rule head takes the types of its variables from the body.
+A new rule head takes the types of its variables from the body; give it
+`"world": "closed"` when it defines a relation that should be false wherever
+no rule proves it. With `"import_facts": ["calls"]` the call edges among the
+retrieved symbols become closed-world facts `calls(caller, callee)` (from the
+ingestion's call index, by the bare name written at the call site), so rules
+can follow the call graph: write recursive definitions as `iff` over `or`,
+which answers false on cycles where an `if` chain can only say unknown:
+
+```json
+{"head": {"predicate": "reaches", "world": "closed",
+          "fields": {"src": {"var": "X"}, "dst": {"var": "Z"}}},
+ "iff": {"or": [{"atom": {"predicate": "calls", "fields": {"caller": {"var": "X"}, "callee": {"var": "Z"}}}},
+                {"and": [{"atom": {"predicate": "calls", "fields": {"caller": {"var": "X"}, "callee": {"var": "Y"}}}},
+                         {"atom": {"predicate": "reaches", "fields": {"src": {"var": "Y"}, "dst": {"var": "Z"}}}}]}]}}
+```
 
 The timeline report uses the same layer: every probe also has Jev answer
 four fixed claims about the change (achieves the stated goal, introduces a

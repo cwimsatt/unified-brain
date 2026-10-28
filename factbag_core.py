@@ -757,6 +757,11 @@ class Judgment:
 class _Index:
     def __init__(self, kb: KnowledgeBase):
         self.kb = kb
+        # A judgment made under a loop cut is valid for that set of active
+        # atoms only (Factbag docs/formalized/recursion.md), so the memo is
+        # keyed by (atom, active atoms). It turns the exponential re-proving
+        # of shared sub-goals on recursive rules into one proof per context.
+        self.memo: dict = {}
         self.literals: dict = {}
         for l in kb._literals:
             self.literals.setdefault(l.atom.key(), ([], []))[0 if l.sign == "+" else 1].append(l)
@@ -800,8 +805,17 @@ def _unify(head: Atom, atom: Atom) -> Optional[dict]:
 
 
 def _solve_atom(ix: _Index, atom: Atom, active: frozenset) -> Judgment:
-    kb = ix.kb
     key = atom.key()
+    memo_key = (key, active)
+    hit = ix.memo.get(memo_key)
+    if hit is not None:
+        return hit
+    j = _solve_atom_uncached(ix, atom, active, key)
+    ix.memo[memo_key] = j
+    return j
+
+
+def _solve_atom_uncached(ix: _Index, atom: Atom, active: frozenset, key: tuple) -> Judgment:
     pos, neg = ix.evidence(atom)
     values: list = []
     positive: list = []
@@ -899,7 +913,8 @@ def _solve_formula(ix: _Index, f, bindings: dict, active: frozenset) -> Judgment
     if isinstance(f, Atom):
         ground = f.substitute(bindings)
         j = _solve_atom(ix, ground, active)
-        j.bindings = dict(bindings)
+        if j.bindings != bindings:
+            j = Judgment(j.value, j.goal, j.reason, j.given, j.literals, j.rule, dict(bindings))
         return j
     if isinstance(f, And):
         parts = [_solve_formula(ix, a, bindings, active) for a in f.args]

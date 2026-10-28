@@ -559,10 +559,14 @@ def _diff_between(org_redis, sid: str, commit: str) -> dict:
 def _callers_text(sym: str, org_redis, as_of: Optional[dict] = None) -> str:
     """Who calls `sym`, with the introducing commit (ingestion call index,
     current + historical). Windowed to the probed commit when as_of is set."""
-    caller_keys = [(dk, "calls") for dk in
-                   _decode_set(org_redis.smembers(f"called_by:{sym}"))]
-    caller_keys += [(dk, "calls_hist") for dk in
-                    _decode_set(org_redis.smembers(f"called_by_hist:{sym}"))]
+    # Call sites name the bare symbol (`inc()`), so a qualified symbol
+    # (`Counter.inc`) is looked up under every name it is indexed by.
+    names = skills_lib.symbol_name_keys(sym)
+    caller_keys = [(dk, "calls") for n in names for dk in
+                   _decode_set(org_redis.smembers(f"called_by:{n}"))]
+    caller_keys += [(dk, "calls_hist") for n in names for dk in
+                    _decode_set(org_redis.smembers(f"called_by_hist:{n}"))]
+    caller_keys = list(dict.fromkeys(caller_keys))
     if not caller_keys:
         return (f"No callers of `{sym}` in the ingestion index, current or "
                 f"historical. (Index covers ingested commits only.)")
@@ -575,7 +579,7 @@ def _callers_text(sym: str, org_redis, as_of: Optional[dict] = None) -> str:
             f = f.decode() if isinstance(f, bytes) else f
             v = v.decode() if isinstance(v, bytes) else v
             callee, _, line = f.rpartition(":")
-            if callee != sym:
+            if callee not in names:
                 continue
             try: rec = json.loads(v)
             except (json.JSONDecodeError, TypeError): rec = {}
@@ -5221,7 +5225,8 @@ async def api_symbol(name: str):
             ids = org_redis.lrange(f"symbol:{dk}", 0, -1)
             defs.append({**_coords(dk), "skill_id": ids[-1] if ids else "",
                          "has_body": bool(org_redis.exists(f"code:{dk}"))})
-        callers = [_coords(dk) for dk in sorted(org_redis.smembers(f"called_by:{name}") or [])]
+        callers = [_coords(dk) for dk in sorted({dk for n in skills_lib.symbol_name_keys(name)
+                                                     for dk in (org_redis.smembers(f"called_by:{n}") or [])})]
         refs = [{**_coords(r["def_key"]), "kind": r["kind"], "ref_line": r["line"],
                  "snippet": r["snippet"]} for r in skills_lib.find_referrers(org_redis, name)]
         return {"name": name, "definitions": defs, "callers": callers, "referrers": refs}
@@ -5344,6 +5349,8 @@ class ClaimsRequest(BaseModel):
     claims: list[ClaimSpec]
     rules: list[RuleSpec] = []
     facts: list[FactSpec] = []
+    import_facts: list[str] = []       # ["calls"]: the call edges among the retrieved
+                                       # symbols become closed-world facts calls(caller, callee)
     max_passages: int = 0              # 0 -> CLAIMS_MAX_PASSAGES
     passage_chars: int = 0             # 0 -> CLAIMS_PASSAGE_CHARS
     min_probability: float = 0.0       # 0 -> CLAIMS_MIN_PROBABILITY
@@ -5365,12 +5372,18 @@ def _claims_settings(req: ClaimsRequest) -> dict:
 
 
 def _rule_head(r) -> tuple:
-    """(name, fields) of a RuleSpec head, which is a name or a dict."""
+    """(name, fields, world) of a RuleSpec head: a name, or a dict with
+    "predicate", optional "fields" and optional "world" ("open" by default;
+    "closed" makes a derived relation false where no rule proves it, which a
+    recursive iff/or definition needs on cyclic graphs)."""
     h = r.head
     if isinstance(h, str):
-        return h, {}
+        return h, {}, "open"
     if isinstance(h, dict) and isinstance(h.get("predicate"), str):
-        return h["predicate"], dict(h.get("fields") or {})
+        world = h.get("world") or "open"
+        if world not in ("open", "closed"):
+            raise _fb.ProgrammerError(f"rule head {h['predicate']!r}: world is open or closed")
+        return h["predicate"], dict(h.get("fields") or {}), world
     raise _fb.ProgrammerError(f"rule head {h!r}: a claim name or {{\"predicate\", \"fields\"}}")
 
 
@@ -5410,18 +5423,32 @@ def _infer_params(head_fields: dict, body, preds: dict) -> dict:
     return params
 
 
-def _claims_build(claims: list, rules: list, facts: list) -> tuple:
+_INDEX_FACTS = {
+    "calls": lambda: _fb.closed_predicate(
+        "calls", {"caller": _fb.entity("symbol"), "callee": _fb.entity("symbol")},
+        description="caller calls callee, from the ingestion's call index"),
+}
+
+
+def _claims_build(claims: list, rules: list, facts: list, import_facts: list = ()) -> tuple:
     """(kb, predicates by name, guard, rule head names) from the request, or
-    HTTPException(400) naming the problem. Symbol entities are added to the
-    knowledge base later, once the evidence is known."""
+    HTTPException(400) naming the problem. Symbol entities and the imported
+    index facts are added to the knowledge base later, once the evidence is
+    known; the index predicates are declared here so rules can use them."""
     kb = _fb.KnowledgeBase()
     preds: dict = {}
     try:
+        for name in import_facts:
+            if name not in _INDEX_FACTS:
+                raise _fb.ProgrammerError(f"import_facts: {name!r} is not one of {sorted(_INDEX_FACTS)}")
+            preds[name] = _INDEX_FACTS[name]()
         for c in claims:
             if not _CLAIM_NAME.match(c.name):
                 raise _fb.ProgrammerError(f"claim name {c.name!r}: use letters, digits and _")
             if c.name in preds:
-                raise _fb.ProgrammerError(f"claim {c.name!r} is listed twice")
+                raise _fb.ProgrammerError(f"claim {c.name!r} is listed twice"
+                                          if c.name not in _INDEX_FACTS else
+                                          f"claim {c.name!r} is the name of an imported index fact")
             if not c.description.strip():
                 raise _fb.ProgrammerError(f"claim {c.name!r} needs a description for Jev")
             if "symbol" in c.params:
@@ -5436,14 +5463,14 @@ def _claims_build(claims: list, rules: list, facts: list) -> tuple:
         for r in rules:
             extra = r.model_extra or {}
             body = {k: extra[k] for k in ("if", "iff") if k in extra}
-            name, head_fields = _rule_head(r)
+            name, head_fields, world = _rule_head(r)
             if len(body) != 1:
                 raise _fb.ProgrammerError(f"rule {name!r}: give exactly one of \"if\" or \"iff\"")
             if not _CLAIM_NAME.match(name):
                 raise _fb.ProgrammerError(f"rule head {name!r}: use letters, digits and _")
             (kind, f), = body.items()
             if name not in preds:                   # a derived conclusion, never classified
-                preds[name] = _fb.Predicate(name, _infer_params(head_fields, f, preds))
+                preds[name] = _fb.Predicate(name, _infer_params(head_fields, f, preds), world=world)
                 kb.declare(preds[name])
             vars_: dict = {}
             head = _fb.atom_from_dict({"predicate": name, "fields": head_fields}, preds, kb, vars_)
@@ -5650,7 +5677,7 @@ async def api_claims_evaluate(req: ClaimsRequest):
     if _jk:
         raise HTTPException(400, _jk)
     cfg = _claims_settings(req)
-    kb, preds, guard, heads = _claims_build(req.claims, req.rules, req.facts)
+    kb, preds, guard, heads = _claims_build(req.claims, req.rules, req.facts, req.import_facts)
     org_redis, _bin = _redis_clients()
     t0 = time.time()
     info: dict = {}
@@ -5666,6 +5693,19 @@ async def api_claims_evaluate(req: ClaimsRequest):
     passages, entities = _claims_passages(rows, cfg["passage_chars"])
     passages = passages[:cfg["max_passages"]]
     kb.entities.add(*entities)
+    if "calls" in req.import_facts:
+        by_dk = {e.id: e for e in entities}
+        to_rank = None
+        if req.from_commit and req.to_commit:
+            w = await asyncio.to_thread(_resolve_window, org_redis, req.from_commit, req.to_commit)
+            to_rank = w["to_rank"] if w else None
+        edges = await asyncio.to_thread(skills_lib.call_edges_among, org_redis, list(by_dk), to_rank)
+        calls_pred = preds["calls"]
+        for e in edges:
+            kb.asserts(calls_pred(caller=by_dk[e["caller"]], callee=by_dk[e["callee"]]),
+                       source=f"index:calls@{(e['commit'] or '')[:12]}", line=e["line"])
+        info["facts"] = {"calls": [{k: e[k] for k in ("caller", "callee", "line", "commit")} for e in edges],
+                         "nodes": len(by_dk)}
     scoped = {c.name for c in req.claims if c.scope == "symbol"}
     cand_filter = ((lambda p, a: a.predicate.name not in scoped or a.fields["symbol"].id == p.doc_id)
                    if scoped else None)
@@ -5697,6 +5737,7 @@ async def api_claims_evaluate(req: ClaimsRequest):
         "claims": [c.model_dump() for c in req.claims],
         "rules": [{"head": r.head, **(r.model_extra or {})} for r in req.rules],
         "facts": [f.model_dump() for f in req.facts],
+        "import_facts": list(req.import_facts),
         "passages": list(passages_by_id.values()),
         "kb": run.kb.to_dict(),
         "judgments": _claims_judge(run.kb, preds, req.claims, heads, passages_by_id),

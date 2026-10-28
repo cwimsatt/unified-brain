@@ -396,3 +396,71 @@ def test_atom_from_dict_shares_variables_and_rules_reject_mixed_types(people):
         kb.rule(safe(who=X)).if_(and_(manages(boss=people["alice"], who=X), income(year=X)))
     with pytest.raises(ProgrammerError, match="different types"):
         kb.rule(income(year=X)).if_(manages(boss=X, who=people["alice"]))
+
+
+# ── recursion over a call graph: the spike behind the tabling decision ──────
+
+def _graph(edges):
+    """A closed-world call graph as facts, plus two definitions of
+    reachability: an `if` chain and an `iff` over `or` (Factbag's shape for
+    a derived closed-world relation)."""
+    kb = KnowledgeBase()
+    syms = {n: Entity("symbol", n) for e in edges for n in e}
+    kb.entities.add(*syms.values())
+    calls = closed_predicate("calls", {"src": entity("symbol"), "dst": entity("symbol")})
+    reach_if = closed_predicate("reach_if", {"src": entity("symbol"), "dst": entity("symbol")})
+    reach_iff = closed_predicate("reach_iff", {"src": entity("symbol"), "dst": entity("symbol")})
+    for a, b in edges:
+        kb.asserts(calls(src=syms[a], dst=syms[b]), source="index")
+    X, Y, Z = variable("X"), variable("Y"), variable("Z")
+    kb.rule(reach_if(src=X, dst=Z)).if_(calls(src=X, dst=Z))
+    kb.rule(reach_if(src=X, dst=Z)).if_(and_(calls(src=X, dst=Y), reach_if(src=Y, dst=Z)))
+    kb.rule(reach_iff(src=X, dst=Z)).iff(or_(calls(src=X, dst=Z),
+                                             and_(calls(src=X, dst=Y), reach_iff(src=Y, dst=Z))))
+    return kb, syms, reach_if, reach_iff
+
+
+def _closure(edges):
+    reach = set(edges)
+    while True:
+        more = {(a, d) for a, b in reach for c, d in reach if b == c} - reach
+        if not more:
+            return reach
+        reach |= more
+
+
+@pytest.mark.parametrize("edges", [
+    [("greet", "hello"), ("Counter.inc", "helper"), ("f", "area")],          # tiny_repo: acyclic
+    [("a", "b"), ("b", "a"), ("c", "d")],                                   # a 2-cycle and an island
+    [("a", "b"), ("b", "c"), ("c", "a"), ("c", "d"), ("d", "d")],           # 3-cycle, self loop
+])
+def test_reachability_on_cyclic_graphs_matches_the_transitive_closure(edges):
+    kb, syms, reach_if, reach_iff = _graph(edges)
+    closure = _closure(edges)
+    names = sorted(syms)
+    for a in names:
+        for b in names:
+            expected = (a, b) in closure
+            vi = query(kb, reach_if(src=syms[a], dst=syms[b])).value
+            vf = query(kb, reach_iff(src=syms[a], dst=syms[b])).value
+            # positive paths are exact in both shapes
+            if expected:
+                assert vi == T and vf == T, (a, b, vi, vf)
+            else:
+                # an `if` rule never establishes falsity: no path is unknown,
+                # with or without tabling (a false body is inconclusive);
+                # the iff/or shape gives the least-fixed-point answer, false,
+                # through the loop cut alone
+                assert vi == U and vf == F, (a, b, vi, vf)
+
+
+def test_memo_makes_shared_subgoals_cheap():
+    # a chain of 60 symbols: without the (atom, active) memo the iff/or
+    # reachability re-proves every suffix for every prefix
+    import time
+    edges = [(f"s{i}", f"s{i + 1}") for i in range(60)] + [("s60", "s0")]
+    kb, syms, _reach_if, reach_iff = _graph(edges)
+    t0 = time.time()
+    assert query(kb, reach_iff(src=syms["s0"], dst=syms["s60"])).value == T
+    assert query(kb, reach_iff(src=syms["s0"], dst=syms["s0"])).value == T
+    assert time.time() - t0 < 5
