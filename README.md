@@ -251,7 +251,7 @@ To switch repositories, stop the service, change `DB_PATH`, start it again.
 
 ### 6. Give it to your coding agent (Cursor, Claude Code, any MCP client)
 
-`unified_brain_mcp.py` is an MCP server with one tool, `retrieve`: the agent
+`unified_brain_mcp.py` is an MCP server with two tools. `retrieve`: the agent
 hands over the question, gets back the evidence — every body that answers it,
 with file, symbol and line — and writes the answer from it. It talks to the
 running service, so step 5 must be running; when the service is stopped the
@@ -273,6 +273,45 @@ Claude Code — the same object in `.mcp.json`. The tool takes 20–60 seconds
 The service also answers plain HTTP for scripts: `POST /api/retrieve`,
 `GET /api/grep`, `/api/symbol/{name}`, `/api/body`, `/api/history`,
 `/api/commit/{hash}`.
+
+### 7. Ask for conclusions, not only evidence (claims)
+
+`retrieve` hands the agent code to read. `evaluate_claims` goes one step
+further: the agent states claims about the code in plain language, Jev reads
+every retrieved body once per claim and says whether it supports it,
+contradicts it or is silent, and each claim comes back as **true**, **false**,
+**conflicted** or **unknown**, with the file, symbol and line of the passages
+it rests on. Rules combine claims into conclusions. The semantics are a Python
+port of [Factbag](https://github.com/factbag/factbag) (Apache-2.0; see
+`NOTICE`): evidence keeps its source, a claim with evidence both ways is
+*conflicted* rather than averaged, a claim nothing spoke to is *unknown*, and a
+`closed` claim with no evidence is *false*.
+
+```bash
+curl -s http://127.0.0.1:8000/api/claims/evaluate -H 'content-type: application/json' -d '{
+  "question": "How does the verifier decide the near-equal-radius cylinder verdict?",
+  "claims": [
+    {"name": "uses_tolerance", "description": "The comparison uses an explicit numeric tolerance rather than exact equality."},
+    {"name": "logs_verdict",   "description": "The verdict is written to a log or report."}
+  ],
+  "rules": [{"head": "auditable", "iff": {"and": ["uses_tolerance", "logs_verdict"]}}]
+}'
+```
+
+The reply holds `judgments` (one per claim and rule head: `value`, `because`,
+`sources`, and the proof tree under `explanation`), the `passages` read, the
+Jev `cost_usd`, and an `id`. `GET /api/claims/{id}` returns it again;
+`POST /api/claims/{id}/retract` with `{"literal_ids": [...]}` removes evidence
+by hand (the ids are in the proof tree) and queries again without a Jev call;
+`POST /api/claims/{id}/resolve` asks Jev to settle conflicted claims by reading
+the disagreeing passages together and retracting the superseded ones.
+`GET /api/claims` lists past evaluations. Evidence comes from the question's
+retrieval, or from explicit `skill_ids`. A claim may carry `params`
+(`{"year": [2024, 2025]}`), which makes one candidate per value; a formula is
+a claim name, `{"not": f}`, `{"and": [..]}`, `{"or": [..]}` or
+`{"atom": {"predicate": name, "fields": {...}}}`. The thresholds are Factbag's
+(a polarity needs probability 0.4 and must beat "irrelevant"); Part 2 of
+`env.example` has the knobs. Cost: one Jev call per passage and claim.
 
 ### What a question costs
 
@@ -323,9 +362,12 @@ push and pull request.
 | `store.py` | the database: one SQLite file, with the text index for grep and the vector tables |
 | `skills_lib.py` | the record layer: skills, bodies per commit, edges, code vectors, grep |
 | `reembed_code_vectors.py` | the embedding pass (one set of vectors per stored body version) |
-| `codebase_qa_service.py` | the FastAPI service: questions, timeline, reports, evidence |
+| `jev_client.py` | the one Jev call helper: provider table (Typesafe or OpenRouter), retries, cost |
+| `factbag_core.py` | claims: facts, rules and four-valued conclusions with provenance (a port of Factbag's core) |
+| `factbag_jev.py` | claims: Jev reads passages and assesses claims; passages, guard, classifier, resolver |
+| `codebase_qa_service.py` | the FastAPI service: questions, timeline, reports, evidence, claims |
 | `templates.py` | the two pages |
-| `unified_brain_mcp.py` | the MCP server for coding agents: one tool, `retrieve` (a thin client of the service) |
+| `unified_brain_mcp.py` | the MCP server for coding agents: `retrieve` and `evaluate_claims` (thin clients of the service) |
 
 ## Known limitations
 

@@ -1,0 +1,19 @@
+unified-brain
+Copyright (c) 2026 DevLoops SINGLE MEMBER P.C.
+Licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).
+
+This product includes a Python port of parts of Factbag
+(https://github.com/factbag/factbag), Copyright Factbag contributors,
+licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0):
+
+- factbag_core.py: the four-valued value lattice (false < unknown < conflicted
+  < true), the evidence and rule combination of `evaluateGroundAtom`, open-
+  and closed-world absence, negation as failure, and the proof tree.
+- factbag_jev.py: the classification task text and the ASSERT / DENY /
+  IRRELEVANT criteria, the admission rule, the KEEP / RETRACT resolver and its
+  criteria, the passage id format and the recursive chunker.
+
+The port is a re-implementation in Python, not a copy of the TypeScript
+source; the Apache-2.0 licence of the original applies to the parts derived
+from it, which are also distributed here under the AGPL-3.0-or-later.
