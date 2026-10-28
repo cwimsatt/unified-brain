@@ -461,6 +461,14 @@ class KnowledgeBase:
         elif known is not pred:
             raise ProgrammerError(f"two different predicates named {pred.name!r}")
 
+    def declare(self, *predicates: Predicate) -> None:
+        """Register predicates up front (a predicate is also registered the
+        first time evidence or a rule mentions it)."""
+        for p in predicates:
+            if not isinstance(p, Predicate):
+                raise ProgrammerError(f"not a predicate: {p!r}")
+            self._register(p)
+
     def _literal(self, sign: str, atom: Atom, source, probability, metadata) -> Literal:
         if not atom.is_ground():
             raise ProgrammerError(f"evidence must be ground: {atom}")

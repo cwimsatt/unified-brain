@@ -141,3 +141,63 @@ def test_tool_wrapper_returns_json_text(monkeypatch):
 def test_server_instructions_point_at_the_note():
     assert "`note`" in ub.mcp.instructions
     assert "`note`" in ub.retrieve.__doc__
+
+
+# ── evaluate_claims ─────────────────────────────────────────────────────────
+
+def _claims_reply(judgments, passages=2, failed=0, jobs=4, **extra):
+    return {"id": "abc", "window": "", "judgments": judgments, "cost_usd": 0.0008,
+            "info": {"classification": {"passages": passages, "failed": failed, "jobs": jobs}}, **extra}
+
+
+J = {"returns_greeting": {"value": "true", "because": "evidence",
+                          "sources": [{"id": "pkg%2Fapp.py%3Ahello%3A4%3AFunctionDef#0-40", "file": "pkg/app.py",
+                                       "symbol": "hello", "line": 4, "struct": "FunctionDef"}],
+                          "explanation": {"claim": "returns_greeting() = true"}},
+     "ready": {"value": "unknown", "because": "inconclusive rules", "sources": [], "explanation": {}}}
+
+
+def test_evaluate_claims_posts_parsed_claims_and_rules():
+    post = _post_returning(_Resp(200, _claims_reply(J)))
+    out = ub._evaluate_claims("how does hello greet?",
+                              ["returns_greeting: The function returns a greeting string.",
+                               {"name": "reviewed", "description": "Signed off.", "world": "closed"}],
+                              rules='[{"head": "ready", "iff": {"and": ["returns_greeting", "reviewed"]}}]',
+                              from_commit="a", to_commit="b", post=post)
+    (c,) = post.calls
+    assert c["url"] == f"{ub.URL}/api/claims/evaluate" and c["timeout"] == 1800
+    assert c["json"] == {
+        "question": "how does hello greet?",
+        "claims": [{"name": "returns_greeting", "description": "The function returns a greeting string."},
+                   {"name": "reviewed", "description": "Signed off.", "world": "closed"}],
+        "rules": [{"head": "ready", "iff": {"and": ["returns_greeting", "reviewed"]}}],
+        "from_commit": "a", "to_commit": "b"}
+    assert set(out) == {"note", "id", "window", "judgments", "cost_usd"} and out["id"] == "abc"
+    assert out["note"].startswith("Evaluated 2 conclusions over 2 passages.")
+    assert out["judgments"]["returns_greeting"] == {
+        "value": "true", "because": "evidence",
+        "sources": [{"file": "pkg/app.py", "symbol": "hello", "line": 4,
+                     "id": "pkg%2Fapp.py%3Ahello%3A4%3AFunctionDef#0-40"}]}
+    assert "explanation" not in out["judgments"]["ready"]       # the compact view
+
+
+def test_evaluate_claims_notes_for_no_passages_and_failures():
+    note = ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(200, _claims_reply(J, passages=0))))["note"]
+    assert note.startswith("No evidence") and "do not guess" in note
+    note = ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(200, _claims_reply(J, failed=3, jobs=8))))["note"]
+    assert note.startswith("3 of 8 judge calls failed")
+
+
+def test_evaluate_claims_bad_input_and_errors_never_raise():
+    post = _post_returning(_Resp(200, _claims_reply(J)))
+    assert ub._evaluate_claims("q", [], post=post)["error"].startswith("bad input: give at least one claim")
+    assert "name: description" in ub._evaluate_claims("q", ["no colon here"], post=post)["error"]
+    assert "name: description" in ub._evaluate_claims("q", [": empty name"], post=post)["error"]
+    assert ub._evaluate_claims("q", ["a: b"], rules="{not json", post=post)["error"].startswith("bad input")
+    assert post.calls == []
+    assert ub._evaluate_claims("q", ["a: b"], post=_post_returning(httpx.ConnectError("refused")))["error"].startswith(
+        "unified-brain service not reachable")
+    assert ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(400, {"detail": "claims: bad"})))["error"] == \
+        "HTTP 400: claims: bad"
+    assert "no evaluation" in ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(200, text="<html>")))["error"]
+    assert "no evaluation" in ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(200, {"id": "x"})))["error"]

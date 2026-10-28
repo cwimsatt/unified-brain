@@ -7,9 +7,11 @@
 """
 unified-brain — MCP server for Cursor, Claude Code and any MCP client
 ---------------------------------------------------------------------
-One tool, `retrieve`: the agent hands over the user's question, gets back
+Two tools. `retrieve`: the agent hands over the user's question, gets back
 the evidence — the code bodies that answer it, each with file, symbol and
-line — and writes the answer from them. It is a thin client of the running
+line — and writes the answer from them. `evaluate_claims`: the agent states
+claims about the code and gets each back as true, false, conflicted or
+unknown with the passages behind it. Both are thin clients of the running
 service (python codebase_qa_service.py); the service holds the database
 file and the API keys.
 
@@ -108,6 +110,90 @@ def _retrieve(question: str, from_commit: str = "", to_commit: str = "",
         "info": info,
         "log": log,
     }
+
+
+def _parse_claims(claims) -> list:
+    """["name: description", ...] (or dicts) -> [{"name", "description"}]."""
+    out = []
+    for c in claims or []:
+        if isinstance(c, dict) and c.get("name") and c.get("description"):
+            out.append({k: c[k] for k in ("name", "description", "params", "world") if k in c})
+            continue
+        if not isinstance(c, str) or ":" not in c:
+            raise ValueError(f"claim {c!r}: write it as \"name: description\"")
+        name, desc = c.split(":", 1)
+        if not name.strip() or not desc.strip():
+            raise ValueError(f"claim {c!r}: write it as \"name: description\"")
+        out.append({"name": name.strip(), "description": desc.strip()})
+    if not out:
+        raise ValueError("give at least one claim")
+    return out
+
+
+def _evaluate_claims(question: str, claims, rules: str = "", from_commit: str = "",
+                     to_commit: str = "", post=httpx.post) -> dict:
+    """POST /api/claims/evaluate and shape the reply for the agent: one line
+    per conclusion with its value and the passages behind it. Never raises."""
+    try:
+        body = {"question": question, "claims": _parse_claims(claims),
+                "rules": json.loads(rules) if (rules or "").strip() else [],
+                "from_commit": from_commit, "to_commit": to_commit}
+    except ValueError as e:
+        return {"error": f"bad input: {e}"}
+    try:
+        r = post(f"{URL}/api/claims/evaluate", json=body, timeout=1800)
+    except httpx.HTTPError as e:
+        return {"error": f"unified-brain service not reachable at {URL}: {e}"}
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except (ValueError, AttributeError):
+            detail = r.text
+        return {"error": f"HTTP {r.status_code}: {detail}"}
+    try:
+        d = r.json()
+    except ValueError:
+        d = None
+    if not isinstance(d, dict) or not isinstance(d.get("judgments"), dict):
+        return {"error": f"unified-brain service answered HTTP 200 with no evaluation: "
+                         f"{(r.text or '')[:300]}"}
+    cls = ((d.get("info") or {}).get("classification") or {})
+    passages, failed, jobs = cls.get("passages") or 0, cls.get("failed") or 0, cls.get("jobs") or 0
+    judgments = {k: {"value": v.get("value"), "because": v.get("because"),
+                     "sources": [{kk: s.get(kk) for kk in ("file", "symbol", "line", "id")}
+                                 for s in (v.get("sources") or [])]}
+                 for k, v in d["judgments"].items()}
+    if passages == 0:
+        note = ("No evidence: nothing was retrieved for the question, so every claim "
+                "is unknown. Say so; do not guess.")
+    elif failed:
+        note = (f"{failed} of {jobs} judge calls failed, so conclusions may rest on "
+                f"partial evidence ({passages} passages read).")
+    else:
+        note = (f"Evaluated {len(judgments)} conclusions over {passages} passages. "
+                "true/false: the passages support/contradict it; unknown: no passage "
+                "spoke to it; conflicted: passages disagree (see sources).")
+    return {"note": note, "id": d.get("id"), "window": d.get("window", ""),
+            "judgments": judgments, "cost_usd": d.get("cost_usd")}
+
+
+@mcp.tool()
+def evaluate_claims(question: str, claims: list[str], rules: str = "",
+                    from_commit: str = "", to_commit: str = "") -> str:
+    """Check specific claims about the code against the evidence.
+
+    Give the question that finds the relevant code and the claims to assess,
+    each as "name: description" (e.g. "validates_input: The function rejects
+    an empty name before using it"). Every retrieved body is read by the
+    judge model for each claim; each conclusion comes back as true, false,
+    conflicted or unknown with the file, symbol and line of the passages it
+    rests on. Optional `rules` (a JSON list) combine claims:
+    [{"head": "safe", "iff": {"and": ["validates_input", {"not": "logs_secret"}]}}].
+    Report the values as given; unknown means the evidence was silent, not
+    that the claim is false. Takes 20–90 seconds.
+    """
+    return json.dumps(_evaluate_claims(question, claims, rules, from_commit, to_commit),
+                      ensure_ascii=False, indent=1)
 
 
 @mcp.tool()

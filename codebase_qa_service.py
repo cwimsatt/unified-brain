@@ -5033,20 +5033,21 @@ def _snippet(body: str, pattern: str, is_regex: bool, first_line: int, around: i
     return {"hit_line": None, "snippet": ""}
 
 
-@app.post("/api/retrieve")
-async def api_retrieve(req: RetrieveRequest):
-    """The question page's retrieval without the answer: embeddings →
-    Jev scoring → Jev chains. Returns the evidence bodies with coordinates."""
-    if not req.question.strip():
+async def _retrieve_evidence(question: str, from_commit: str = "", to_commit: str = "") -> dict:
+    """/api/retrieve's work: embeddings → Jev scoring → Jev chains, under the
+    retrieve lock. Raises HTTPException(400) for an empty question or a
+    missing Jev key and 502 when Jev scored nothing; returns the reply dict
+    (question, window, evidence, leads, log, info)."""
+    if not question.strip():
         raise HTTPException(400, "question is empty")
     _jk = _jev_key_missing()
     if _jk:
         raise HTTPException(400, _jk)
     org_redis, org_redis_binary = _redis_clients()
     as_of, window = None, ""
-    if req.from_commit and req.to_commit:
-        as_of = await asyncio.to_thread(_resolve_window, org_redis, req.from_commit, req.to_commit)
-        window = (f"{req.from_commit[:12]}..{req.to_commit[:12]}" if as_of
+    if from_commit and to_commit:
+        as_of = await asyncio.to_thread(_resolve_window, org_redis, from_commit, to_commit)
+        window = (f"{from_commit[:12]}..{to_commit[:12]}" if as_of
                   else "requested commits are not in the index — current state used")
     try:
         target = _llm_target()
@@ -5055,7 +5056,7 @@ async def api_retrieve(req: RetrieveRequest):
     log, result = [], None
     t0 = time.time()
     async with _RETRIEVE_LOCK:
-        async for kind, payload in _gather_evidence(req.question, org_redis,
+        async for kind, payload in _gather_evidence(question, org_redis,
                                                     org_redis_binary, as_of, target):
             if kind == "status":
                 log.append(payload)
@@ -5067,7 +5068,7 @@ async def api_retrieve(req: RetrieveRequest):
     print(f"📦 retrieve: {len(result['skills'])} bodies, {chars} chars "
           f"(~{chars // 4} tokens) handed over in {time.time() - t0:.1f}s")
     return {
-        "question": req.question,
+        "question": question,
         "window": window,
         "evidence": [_evidence_row(s) for s in result["skills"]],
         "leads": [{"file": l["file"], "symbol": l["symbol"], "trail": l["trail"]}
@@ -5075,6 +5076,13 @@ async def api_retrieve(req: RetrieveRequest):
         "log": log,
         "info": result["info"],
     }
+
+
+@app.post("/api/retrieve")
+async def api_retrieve(req: RetrieveRequest):
+    """The question page's retrieval without the answer: embeddings →
+    Jev scoring → Jev chains. Returns the evidence bodies with coordinates."""
+    return await _retrieve_evidence(req.question, req.from_commit, req.to_commit)
 
 
 GREP_MAX_RESULTS = int(os.environ.get("GREP_MAX_RESULTS", "500"))
@@ -5204,6 +5212,359 @@ async def api_commit(commit: str):
             out[ev] = rows
         return out
     return await asyncio.to_thread(_run)
+
+
+
+# ── Claims: evidence and four-valued conclusions over the retrieved code ──────
+# A Factbag-style layer (factbag_core, factbag_jev): the caller states claims
+# in plain language, Jev reads every retrieved body and says whether it
+# supports, contradicts or is silent on each claim, the admitted answers are
+# evidence with the passage as source, and rules over the claims are queried
+# for true / false / conflicted / unknown with the proof tree.
+import factbag_core as _fb
+import factbag_jev as _fbj
+
+_CLAIM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class ClaimSpec(BaseModel):
+    name: str
+    description: str
+    params: dict[str, list] = {}       # field -> finite list of values (an enumeration)
+    world: Literal["open", "closed"] = "open"
+
+
+class RuleSpec(BaseModel):
+    """{"head": "ready", "if": <formula>} or {"head": ..., "iff": <formula>}.
+    A formula is a claim name, {"not": f}, {"and": [f...]}, {"or": [f...]} or
+    {"atom": {"predicate": name, "fields": {...}}} for claims with params."""
+    head: str
+    model_config = {"extra": "allow"}
+
+
+class FactSpec(BaseModel):
+    claim: str
+    fields: dict = {}
+    value: bool = True
+    source: str = "application"
+
+
+class ClaimsRequest(BaseModel):
+    question: str = ""                 # retrieval question, or
+    skill_ids: list[str] = []          # explicit symbols
+    from_commit: str = ""
+    to_commit: str = ""
+    claims: list[ClaimSpec]
+    rules: list[RuleSpec] = []
+    facts: list[FactSpec] = []
+    max_passages: int = 0              # 0 -> CLAIMS_MAX_PASSAGES
+    passage_chars: int = 0             # 0 -> CLAIMS_PASSAGE_CHARS
+    min_probability: float = 0.0       # 0 -> CLAIMS_MIN_PROBABILITY
+    ambiguity_margin: float = -1.0     # <0 -> CLAIMS_AMBIGUITY_MARGIN
+
+
+class RetractRequest(BaseModel):
+    literal_ids: list[str]
+
+
+def _claims_settings(req: ClaimsRequest) -> dict:
+    return {
+        "max_passages": req.max_passages or int(os.environ.get("CLAIMS_MAX_PASSAGES", "60")),
+        "passage_chars": req.passage_chars or int(os.environ.get("CLAIMS_PASSAGE_CHARS", "8000")),
+        "min_probability": req.min_probability or float(os.environ.get("CLAIMS_MIN_PROBABILITY", "0.4")),
+        "ambiguity_margin": (req.ambiguity_margin if req.ambiguity_margin >= 0
+                             else float(os.environ.get("CLAIMS_AMBIGUITY_MARGIN", "0"))),
+    }
+
+
+def _claims_build(claims: list, rules: list, facts: list) -> tuple:
+    """(kb, predicates by name, guard, queried atoms) from the request, or
+    HTTPException(400) naming the problem."""
+    kb = _fb.KnowledgeBase()
+    preds: dict = {}
+    try:
+        for c in claims:
+            if not _CLAIM_NAME.match(c.name):
+                raise _fb.ProgrammerError(f"claim name {c.name!r}: use letters, digits and _")
+            if c.name in preds:
+                raise _fb.ProgrammerError(f"claim {c.name!r} is listed twice")
+            if not c.description.strip():
+                raise _fb.ProgrammerError(f"claim {c.name!r} needs a description for Jev")
+            params = {k: _fb.enumeration(*v) for k, v in c.params.items()}
+            preds[c.name] = _fb.Predicate(c.name, params, world=c.world, description=c.description)
+        kb.declare(*preds.values())
+        heads = []
+        for r in rules:
+            extra = r.model_extra or {}
+            body = {k: extra[k] for k in ("if", "iff") if k in extra}
+            if len(body) != 1:
+                raise _fb.ProgrammerError(f"rule {r.head!r}: give exactly one of \"if\" or \"iff\"")
+            if not _CLAIM_NAME.match(r.head):
+                raise _fb.ProgrammerError(f"rule head {r.head!r}: use letters, digits and _")
+            if r.head not in preds:                 # a derived conclusion, never classified
+                preds[r.head] = _fb.predicate(r.head)
+                kb.declare(preds[r.head])
+            (kind, f), = body.items()
+            formula = _fb.formula_from_dict(f, preds, kb)
+            getattr(kb.rule(preds[r.head]()), "if_" if kind == "if" else "iff")(formula)
+            heads.append(r.head)
+        for f in facts:
+            if f.claim not in preds:
+                raise _fb.ProgrammerError(f"fact {f.claim!r} names no claim or rule head")
+            atom = preds[f.claim](**f.fields)
+            (kb.asserts if f.value else kb.denies)(atom, source=f.source or "application")
+    except _fb.ProgrammerError as e:
+        raise HTTPException(400, f"claims: {e}")
+    guard = _fbj.Guard()
+    for c in claims:
+        guard = guard.permit("assert", preds[c.name]).permit("deny", preds[c.name])
+    return kb, preds, guard, heads
+
+
+def _claims_passages(rows: list, passage_chars: int) -> list:
+    """Evidence rows (as /api/retrieve returns them) -> passages whose doc id
+    is the symbol's def_key, so a source maps back to file, symbol and line."""
+    out = []
+    for row in rows:
+        text = row.get("code") or ""
+        if not text.strip():
+            continue
+        doc_id = row.get("def_key") or f"{row.get('file', '')}:{row.get('symbol', '')}" or row.get("skill_id", "")
+        meta = {k: row.get(k) for k in ("def_key", "file", "symbol", "line", "struct", "skill_id")}
+        out.extend(_fbj.split_passages(doc_id, text, size=passage_chars,
+                                       overlap=min(200, passage_chars // 4), meta=meta))
+    return out
+
+
+def _claims_rows_for_skills(org_redis, skill_ids: list) -> list:
+    rows = []
+    for sid in skill_ids:
+        raw = org_redis.get(f"skill:{sid}")
+        if not raw:
+            raise HTTPException(400, f"skill_ids: {sid!r} is not in the index")
+        sk = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        dk = sk.get("def_key") or ""
+        rows.append(_evidence_row({"def_key": dk, "skill_id": sid, "score": None,
+                                   "code": skills_lib.get_code(org_redis, dk)}))
+    return rows
+
+
+def _claims_sources(node: dict, acc: set) -> set:
+    for e in node.get("evidence") or []:
+        if e.get("source"):
+            acc.add(e["source"])
+    for g in node.get("given") or []:
+        _claims_sources(g, acc)
+    return acc
+
+
+def _claims_judge(kb, preds: dict, claims: list, heads: list, passages_by_id: dict) -> dict:
+    """Query every claim atom (each enumeration member for claims with params)
+    and every rule head; each judgment carries its proof tree and the passages
+    it rests on."""
+    out: dict = {}
+    for name in [c.name for c in claims] + heads:
+        pred = preds[name]
+        atoms = _fbj.candidates(kb, pred) if pred.params else [pred()]
+        for atom in atoms:
+            j = _fb.query(kb, atom)
+            tree = _fb.explain(j)
+            srcs = sorted(_claims_sources(tree, set()))
+            out[repr(atom) if pred.params else name] = {
+                "value": j.value,
+                "because": tree.get("because"),
+                "sources": [{"id": s, **{k: v for k, v in (passages_by_id.get(s) or {}).items()
+                                         if k in ("file", "symbol", "line", "struct", "def_key")}}
+                            for s in srcs],
+                "explanation": tree,
+            }
+    return out
+
+
+def _claims_record_key(eid: str) -> str:
+    return f"claims:{eid}"
+
+
+def _claims_load(org_redis, eid: str) -> dict:
+    raw = org_redis.get(_claims_record_key(eid))
+    if not raw:
+        raise HTTPException(404, f"no claims evaluation {eid!r}")
+    return json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+
+
+def _claims_save(org_redis, rec: dict) -> None:
+    org_redis.set(_claims_record_key(rec["id"]), json.dumps(rec, ensure_ascii=False))
+    org_redis.zadd("claims_index", {rec["id"]: rec.get("created", time.time())})
+
+
+def _claims_rebuild(rec: dict) -> tuple:
+    """(kb, predicates, claims, heads, passages_by_id) from a stored record."""
+    kb = _fb.KnowledgeBase.from_dict(rec["kb"])
+    preds = {p.name: p for p in kb.predicates()}
+    claims = [ClaimSpec(**c) for c in rec["claims"]]
+    heads = [r["head"] for r in rec["rules"]]
+    for name in [c.name for c in claims] + heads:
+        if name not in preds:                       # declared but never mentioned
+            preds[name] = _fb.predicate(name)
+            kb.declare(preds[name])
+    return kb, preds, claims, heads, {p["id"]: p for p in rec["passages"]}
+
+
+@app.post("/api/claims/evaluate")
+async def api_claims_evaluate(req: ClaimsRequest):
+    """State claims about the code; get back true / false / conflicted /
+    unknown per claim and rule head, with the proof and the passages behind
+    it. Evidence comes from the question's retrieval (as /api/retrieve) or
+    from explicit skill_ids. The evaluation is stored under an id for
+    /api/claims/{id}, .../retract and .../resolve."""
+    if not req.claims:
+        raise HTTPException(400, "claims: give at least one claim")
+    if not req.question.strip() and not req.skill_ids:
+        raise HTTPException(400, "give a question to retrieve evidence for, or skill_ids")
+    _jk = _jev_key_missing()
+    if _jk:
+        raise HTTPException(400, _jk)
+    cfg = _claims_settings(req)
+    kb, preds, guard, heads = _claims_build(req.claims, req.rules, req.facts)
+    org_redis, _bin = _redis_clients()
+    t0 = time.time()
+    info: dict = {}
+    window = ""
+    if req.skill_ids:
+        rows = await asyncio.to_thread(_claims_rows_for_skills, org_redis, req.skill_ids)
+        info["retrieval"] = {"mode": "skill_ids", "evidence": len(rows)}
+    else:
+        got = await _retrieve_evidence(req.question, req.from_commit, req.to_commit)
+        rows, window = got["evidence"], got["window"]
+        info["retrieval"] = {"mode": "question", "evidence": len(rows), **got["info"]}
+    rows = rows[:cfg["max_passages"]]
+    passages = _claims_passages(rows, cfg["passage_chars"])[:cfg["max_passages"]]
+    run = _fbj.classifier(passages, kb, guard, min_probability=cfg["min_probability"],
+                          ambiguity_margin=cfg["ambiguity_margin"])
+    workers = max(1, min(int(os.environ.get("JEV_CONCURRENCY", "128")), len(run.jobs) or 1))
+    client = _jev_client(max_connections=workers)
+    try:
+        results = await asyncio.to_thread(run.execute_all, _jev_post, client, workers)
+    finally:
+        client.close()
+    failed = [(j, e) for j, e in results if e]
+    if run.jobs and len(failed) == len(run.jobs):
+        raise HTTPException(502, f"Jev assessed none of {len(passages)} passages: {failed[0][1]}")
+    info["classification"] = {
+        "passages": len(passages), "jobs": len(run.jobs), "failed": len(failed),
+        "first_error": failed[0][1] if failed else None,
+        "admitted": len(run.kb.literals()) - len(kb.literals()),
+        "min_probability": cfg["min_probability"], "ambiguity_margin": cfg["ambiguity_margin"],
+        "secs": round(time.time() - t0, 2),
+    }
+    passages_by_id = {p.id: {"id": p.id, "start": p.start, "end": p.end, **p.meta, "text": p.text}
+                      for p in passages}
+    rec = {
+        "id": secrets.token_hex(8),
+        "created": time.time(),
+        "question": req.question,
+        "window": window,
+        "claims": [c.model_dump() for c in req.claims],
+        "rules": [{"head": r.head, **(r.model_extra or {})} for r in req.rules],
+        "facts": [f.model_dump() for f in req.facts],
+        "passages": list(passages_by_id.values()),
+        "kb": run.kb.to_dict(),
+        "judgments": _claims_judge(run.kb, preds, req.claims, heads, passages_by_id),
+        "cost_usd": round(run.cost, 6),
+        "info": info,
+    }
+    await asyncio.to_thread(_claims_save, org_redis, rec)
+    print(f"⚖️  claims {rec['id']}: {len(req.claims)} claims over {len(passages)} passages, "
+          f"{info['classification']['admitted']} literals admitted, ${run.cost:.4f}, "
+          f"{time.time() - t0:.1f}s")
+    return rec
+
+
+@app.get("/api/claims")
+async def api_claims_list(limit: int = 50):
+    org_redis, _bin = _redis_clients()
+    ids = org_redis.zrevrange("claims_index", 0, max(0, limit - 1))
+    out = []
+    for eid in ids:
+        eid = eid.decode() if isinstance(eid, bytes) else eid
+        raw = org_redis.get(_claims_record_key(eid))
+        if not raw:
+            continue
+        rec = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        out.append({"id": rec["id"], "created": rec["created"], "question": rec["question"],
+                    "claims": [c["name"] for c in rec["claims"]],
+                    "values": {k: v["value"] for k, v in rec["judgments"].items()},
+                    "cost_usd": rec["cost_usd"]})
+    return {"evaluations": out}
+
+
+@app.get("/api/claims/{eid}")
+async def api_claims_get(eid: str):
+    org_redis, _bin = _redis_clients()
+    return await asyncio.to_thread(_claims_load, org_redis, eid)
+
+
+@app.post("/api/claims/{eid}/retract")
+async def api_claims_retract(eid: str, req: RetractRequest):
+    """Remove literals (by the ids the proof trees show) and query again:
+    a human correction without a new Jev call."""
+    org_redis, _bin = _redis_clients()
+    rec = await asyncio.to_thread(_claims_load, org_redis, eid)
+    kb, preds, claims, heads, passages_by_id = _claims_rebuild(rec)
+    gone = [lid for lid in req.literal_ids if kb.retract(lid)]
+    missing = [lid for lid in req.literal_ids if lid not in gone]
+    if missing:
+        raise HTTPException(400, f"no such literals: {missing}")
+    rec["kb"] = kb.to_dict()
+    rec["judgments"] = _claims_judge(kb, preds, claims, heads, passages_by_id)
+    rec.setdefault("history", []).append({"ts": time.time(), "retracted": gone})
+    await asyncio.to_thread(_claims_save, org_redis, rec)
+    return rec
+
+
+@app.post("/api/claims/{eid}/resolve")
+async def api_claims_resolve(eid: str):
+    """Ask Jev to settle every conflicted claim: it reads the passages behind
+    the conflict together and marks the superseded ones, whose evidence is
+    retracted; then everything is queried again."""
+    _jk = _jev_key_missing()
+    if _jk:
+        raise HTTPException(400, _jk)
+    org_redis, _bin = _redis_clients()
+    rec = await asyncio.to_thread(_claims_load, org_redis, eid)
+    kb, preds, claims, heads, passages_by_id = _claims_rebuild(rec)
+    passages = {pid: _fbj.Passage(pid, p.get("def_key") or "", p["start"], p["end"], p["text"],
+                                  {k: v for k, v in p.items() if k not in ("id", "text")})
+                for pid, p in passages_by_id.items()}
+    try:
+        run = _fbj.resolver(passages, kb)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    client = _jev_client()
+    try:
+        results = await asyncio.to_thread(run.execute_all, _jev_post, client)
+    finally:
+        client.close()
+    failed = [e for _j, e in results if e]
+    if run.jobs and len(failed) == len(run.jobs):
+        raise HTTPException(502, f"Jev resolved none of {len(run.jobs)} conflicts: {failed[0]}")
+    resolution = []
+    for job, err in results:
+        r = {"atom": repr(job.atom), "error": err}
+        if job.result:
+            r.update({"retracted": [{"source": x["source"], "literals": x["retracted"],
+                                     "probabilities": x["answer"]["probabilities"]} for x in job.result["retracted"]],
+                      "kept": [{"source": x["source"], "probabilities": x["answer"]["probabilities"]}
+                               for x in job.result["kept"]]})
+        resolution.append(r)
+    rec["kb"] = run.kb.to_dict()
+    rec["judgments"] = _claims_judge(run.kb, preds, claims, heads, passages_by_id)
+    rec["cost_usd"] = round(rec.get("cost_usd", 0.0) + run.cost, 6)
+    rec.setdefault("history", []).append({"ts": time.time(), "resolved": resolution,
+                                          "cost_usd": round(run.cost, 6)})
+    rec["resolution"] = resolution
+    await asyncio.to_thread(_claims_save, org_redis, rec)
+    return rec
 
 
 @app.get("/health")

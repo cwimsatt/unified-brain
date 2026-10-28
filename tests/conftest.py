@@ -185,9 +185,16 @@ def jev_mock(service, monkeypatch):
     triage (JEV_HIT_TRIAGE=0 here) and the probe pick use the same helper
     but are not driven. score questions answer 4.0 when the state's symbol
     is in `relevant`, else 0.0; choice answers 'reject' (so a chain stops at
-    its seeds); noul answers 0.0. `fail` set to an error string makes every
-    call fail with it."""
-    mock = types.SimpleNamespace(relevant=set(), fail=None, calls=[])
+    its seeds); noul answers 0.0. Claims questions (ASSERT/DENY/IRRELEVANT)
+    answer from `claims`, resolver questions (KEEP/RETRACT) from `standing`.
+    `fail` set to an error string makes every call fail with it."""
+    mock = types.SimpleNamespace(relevant=set(), fail=None, calls=[],
+                                 # claims: {claim name: {"assert": [substr...], "deny": [...]}}
+                                 # -> ASSERT 0.9 / DENY 0.9 when a substring is in the
+                                 # passage text, else IRRELEVANT 1.0
+                                 claims={},
+                                 # standing: substrings of passages the resolver RETRACTs
+                                 standing=[])
 
     def _post(client, state, questions, *, what, attempts=4):
         mock.calls.append({"what": what, "state": dict(state),
@@ -200,6 +207,23 @@ def jev_mock(service, monkeypatch):
             if kind == "score":
                 answers[key] = {"score": 4.0 if state.get("symbol") in mock.relevant
                                 else 0.0}
+            elif kind == "choice" and set(q.get("criteria") or ()) == {"ASSERT", "DENY", "IRRELEVANT"}:
+                name = q["instructions"]["predicate"]["name"]
+                text = state["document"]["text"]
+                spec = mock.claims.get(name, {})
+                if any(s in text for s in spec.get("assert", [])):
+                    p = {"ASSERT": 0.9, "DENY": 0.05, "IRRELEVANT": 0.05}
+                elif any(s in text for s in spec.get("deny", [])):
+                    p = {"ASSERT": 0.05, "DENY": 0.9, "IRRELEVANT": 0.05}
+                else:
+                    p = {"ASSERT": 0.0, "DENY": 0.0, "IRRELEVANT": 1.0}
+                answers[key] = {"choice": max(p, key=p.get), "probabilities": p}
+            elif kind == "choice" and set(q.get("criteria") or ()) == {"KEEP", "RETRACT"}:
+                text = state["documents"][int(key.split("_")[1])]["text"]
+                retract = any(s in text for s in mock.standing)
+                answers[key] = {"choice": "RETRACT" if retract else "KEEP",
+                                "probabilities": {"KEEP": 0.2 if retract else 0.9,
+                                                  "RETRACT": 0.8 if retract else 0.1}}
             elif kind == "choice":
                 # the service lists the options under `criteria` (a dict
                 # name -> description, or a list)
