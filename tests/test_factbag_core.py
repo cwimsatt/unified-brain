@@ -371,3 +371,28 @@ def test_random_programs_match_the_reference():
                 kb.denies(b(), source="s")
             getattr(kb.rule(h()), "if_" if kind == "if" else "iff")(b())
         assert query(kb, h()).value == _reference(ev, list(zip(kinds, bodies))), (ev, kinds, bodies)
+
+
+# ── atom_from_dict and variable typing ──────────────────────────────────────
+
+def test_atom_from_dict_shares_variables_and_rules_reject_mixed_types(people):
+    from factbag_core import atom_from_dict
+    manages = predicate("manages", {"boss": entity("person"), "who": entity("person")})
+    income = predicate("income", {"year": enumeration(2024, 2025)})
+    safe = predicate("safe", {"who": entity("person")})
+    preds = {"manages": manages, "income": income, "safe": safe}
+    kb = KnowledgeBase()
+    vars_ = {}
+    head = atom_from_dict({"predicate": "safe", "fields": {"who": {"var": "W"}}}, preds, kb, vars_)
+    body = formula_from_dict({"atom": {"predicate": "manages", "fields": {"boss": {"entity": ["person", "alice"]}, "who": {"var": "W"}}}}, preds, kb, vars_)
+    assert head.fields["who"] is body.fields["who"] and vars_ == {"W": head.fields["who"]}
+    assert atom_from_dict("safe", {"safe": predicate("safe")}, kb).predicate.name == "safe"
+    with pytest.raises(ProgrammerError, match="unknown claim"):
+        atom_from_dict({"predicate": "nope"}, preds, kb)
+    with pytest.raises(ProgrammerError, match="an atom is"):
+        atom_from_dict(42, preds, kb)
+    X = variable("X")
+    with pytest.raises(ProgrammerError, match="different types"):
+        kb.rule(safe(who=X)).if_(and_(manages(boss=people["alice"], who=X), income(year=X)))
+    with pytest.raises(ProgrammerError, match="different types"):
+        kb.rule(income(year=X)).if_(manages(boss=X, who=people["alice"]))

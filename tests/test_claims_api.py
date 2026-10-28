@@ -177,3 +177,81 @@ def test_all_classifier_calls_failing_is_502(client, ingested_db, jev_mock):
     res = _evaluate(client, question="", skill_ids=[sid],
                     claims=[{"name": "c", "description": "d"}])
     assert res.status_code == 502 and res.json()["detail"].startswith("Jev assessed none of 1 passages")
+
+
+# ── per-symbol claims ───────────────────────────────────────────────────────
+
+SYMBOL_CLAIMS = [
+    {"name": "calls_out", "description": "The function calls another function.", "scope": "symbol"},
+    {"name": "prints", "description": "The function prints to standard output.", "scope": "symbol"},
+    {"name": "is_test", "description": "The function is a test.", "scope": "symbol", "world": "closed"},
+]
+NOISY = {"head": {"predicate": "noisy_caller", "fields": {"symbol": {"var": "S"}}},
+         "iff": {"and": [{"atom": {"predicate": "calls_out", "fields": {"symbol": {"var": "S"}}}},
+                         {"atom": {"predicate": "prints", "fields": {"symbol": {"var": "S"}}}}]}}
+
+
+def _arm_symbols(jev_mock):
+    jev_mock.relevant = {"hello", "greet", "Counter.inc", "helper"}
+    jev_mock.claims = {"calls_out": {"assert": ["return hello()", "helper();"]},
+                       "prints": {"assert": ["println"]}}
+
+
+def test_per_symbol_claims_and_a_rule_with_a_variable(client, jev_mock):
+    _arm_symbols(jev_mock)
+    res = _evaluate(client, question="what calls what?", claims=SYMBOL_CLAIMS, rules=[NOISY])
+    assert res.status_code == 200, res.text
+    d = res.json()
+    j = d["judgments"]
+    assert set(j) == {"calls_out", "prints", "is_test", "noisy_caller"}
+    assert all(v["scope"] == "symbol" for v in j.values())
+    rows = {r["symbol"]: r for r in j["calls_out"]["by_symbol"]}
+    assert {s: r["value"] for s, r in rows.items()} == {"hello": "unknown", "greet": "true",
+                                                         "Counter.inc": "true", "helper": "unknown"}
+    assert j["calls_out"]["summary"] == {"false": 0, "unknown": 2, "conflicted": 0, "true": 2}
+    assert [(r["file"], r["line"]) for r in j["calls_out"]["by_symbol"]] == sorted(
+        (r["file"], r["line"]) for r in j["calls_out"]["by_symbol"])
+    # each symbol's answer rests on its own body only
+    (src,) = rows["greet"]["sources"]
+    assert src["symbol"] == "greet" and src["file"] == "pkg/app.py" and rows["greet"]["atom"].startswith("calls_out(symbol:pkg/app.py:greet:")
+    assert {r["symbol"]: r["value"] for r in j["prints"]["by_symbol"]}["Counter.inc"] == "true"
+    assert {r["value"] for r in j["is_test"]["by_symbol"]} == {"false"}          # closed world
+    noisy = {r["symbol"]: r["value"] for r in j["noisy_caller"]["by_symbol"]}
+    assert noisy == {"hello": "unknown", "greet": "unknown", "Counter.inc": "true", "helper": "unknown"}
+    assert j["noisy_caller"]["by_symbol"][0]["explanation"]["claim"].startswith("noisy_caller(symbol:")
+    # one Jev call per passage and claim, each with exactly its own symbol as the candidate
+    calls = [c for c in jev_mock.calls if c["what"] == "claims"]
+    cls = d["info"]["classification"]
+    assert cls["passages"] == 4 and cls["jobs"] == len(calls) == 12 and cls["failed"] == 0
+    for c in calls:
+        (cand,) = c["state"]["candidates"]
+        assert cand["fields"]["symbol"]["type"] == "symbol" and cand["fields"]["symbol"]["symbol"] in rows
+    # persisted and rebuilt: a human retraction of Counter.inc's prints literal
+    stored = client.get(f"/api/claims/{d['id']}").json()
+    assert stored["judgments"] == j and stored["rules"] == [NOISY]
+    inc = {r["symbol"]: r for r in j["prints"]["by_symbol"]}["Counter.inc"]
+    (lit,) = inc["explanation"]["evidence"]
+    r2 = client.post(f"/api/claims/{d['id']}/retract", json={"literal_ids": [lit["id"]]}).json()
+    assert {r["symbol"]: r["value"] for r in r2["judgments"]["noisy_caller"]["by_symbol"]}["Counter.inc"] == "unknown"
+    assert {r["symbol"]: r["value"] for r in r2["judgments"]["calls_out"]["by_symbol"]}["Counter.inc"] == "true"
+
+
+def test_per_symbol_errors(client, jev_mock):
+    _arm_symbols(jev_mock)
+    one = [SYMBOL_CLAIMS[0]]
+    bad = [
+        (one, [{"head": {"predicate": "h", "fields": {"symbol": {"var": "Z"}}}, "if": "calls_out"}], "not used in the body"),
+        (one, [{"head": {"predicate": "h", "fields": {"symbol": "literal"}}, "if": "calls_out"}], "variables only"),
+        (one, [{"head": 7, "if": "calls_out"}], "a claim name or"),
+        (one, [{"head": "h", "if": "calls_out"}], "fields are"),          # calls_out needs its symbol
+        (one + [{"name": "yearly", "description": "d", "params": {"year": [2024]}}],
+         [{"head": {"predicate": "h", "fields": {"x": {"var": "V"}}},
+           "if": {"and": [{"atom": {"predicate": "yearly", "fields": {"year": {"var": "V"}}}},
+                          {"atom": {"predicate": "calls_out", "fields": {"symbol": {"var": "V"}}}}]}}],
+         "different types"),
+        ([{"name": "c", "description": "d", "params": {"symbol": ["a"]}}], [], "per-symbol scope"),
+    ]
+    for claims, rules, msg in bad:
+        res = _evaluate(client, claims=claims, rules=rules)
+        assert res.status_code == 400 and msg in res.json()["detail"], (msg, res.text)
+    assert jev_mock.calls == []

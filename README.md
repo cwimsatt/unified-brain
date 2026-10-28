@@ -313,6 +313,19 @@ a claim name, `{"not": f}`, `{"and": [..]}`, `{"or": [..]}` or
 (a polarity needs probability 0.4 and must beat "irrelevant"); Part 2 of
 `env.example` has the knobs. Cost: one Jev call per passage and claim.
 
+A claim with `"scope": "symbol"` is asked of every retrieved symbol
+separately, each from its own body ("which of these functions validate
+input"), and comes back as a `by_symbol` table with a `summary`; the MCP tool
+does the same with `per_symbol=true`. Rules then take variables:
+
+```json
+{"head": {"predicate": "safe", "fields": {"symbol": {"var": "S"}}},
+ "iff": {"and": [{"atom": {"predicate": "validates_input", "fields": {"symbol": {"var": "S"}}}},
+                 {"not": {"atom": {"predicate": "logs_secret", "fields": {"symbol": {"var": "S"}}}}}]}}
+```
+
+A new rule head takes the types of its variables from the body.
+
 ### What a question costs
 
 Measured with the configuration in Part 1 of `env.example`:

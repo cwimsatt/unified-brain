@@ -251,3 +251,23 @@ def test_resolver_thresholds_and_missing_sources(claims):
     with pytest.raises(ValueError, match="needs a passage source"):
         resolver({P1.id: P1, P2.id: P2}, kb)
     assert resolver({}, KnowledgeBase()).jobs == []
+
+
+# ── candidate_filter (per-symbol claims) ─────────────────────────────────────
+
+def test_candidate_filter_restricts_each_passage_to_its_own_symbol():
+    kb = KnowledgeBase()
+    a, b = Entity("symbol", "a.py:f:1:FunctionDef", file="a.py", symbol="f"), Entity("symbol", "a.py:g:5:FunctionDef")
+    kb.entities.add(a, b)
+    uses_io = predicate("uses_io", {"symbol": entity("symbol")}, description="The function does I/O.")
+    kb.declare(uses_io)
+    pa = Passage("x#0-1", a.id, 0, 1, "f", {})
+    pb = Passage("y#0-1", b.id, 0, 1, "g", {})
+    assert [len(j.atoms) for j in classifier([pa, pb], kb).jobs] == [2, 2]
+    run = classifier([pa, pb], kb, candidate_filter=lambda p, atom: atom.fields["symbol"].id == p.doc_id)
+    assert [(j.passage.id, [x.fields["symbol"].id for x in j.atoms]) for j in run.jobs] == [
+        ("x#0-1", [a.id]), ("y#0-1", [b.id])]
+    state, _q = run.jobs[0].request()
+    assert state["candidates"] == [{"id": "candidate_0", "fields": {"symbol": {"type": "symbol", "id": a.id, "file": "a.py", "symbol": "f"}}}]
+    # a passage with nothing left gets no job
+    assert [j.passage.id for j in classifier([pa, pb], kb, candidate_filter=lambda p, atom: p is pa).jobs] == ["x#0-1"]

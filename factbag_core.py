@@ -501,15 +501,17 @@ class KnowledgeBase:
         if rule.kind == "iff" and existing or any(r.kind == "iff" for r in existing):
             raise ProgrammerError(f"{head.predicate.name}: an iff rule must be the only rule "
                                   "for its predicate")
-        # Safety: every body variable must have a finite domain.
+        # Safety: every body variable must have a finite domain, and a
+        # variable means one thing: every position it fills has the same type.
         head_vars = set(head.variables())
-        for v in _formula_vars(rule.body):
-            if v in head_vars:
-                continue
-            kinds = {p.kinds[k] for p, k in _formula_var_specs(rule.body, v)}
-            if kinds & {"str", "number", "date"}:
+        for v in _formula_vars(rule.body) + list(head_vars):
+            specs = _formula_var_specs(rule.body, v) + [(head.predicate, k) for k, x in head.fields.items() if x is v]
+            kinds = {p.kinds[k] for p, k in specs}
+            if v not in head_vars and kinds & {"str", "number", "date"}:
                 raise ProgrammerError(f"{v!r} in {rule!r} is unsafe: it is not bound by the "
                                       "head and has no finite domain")
+            if len(kinds) > 1 or len({_spec_key(p.params[k]) for p, k in specs}) > 1:
+                raise ProgrammerError(f"{v!r} in {rule!r} is used with different types")
         self._rules.append(rule)
         return rule
 
@@ -592,6 +594,14 @@ class KnowledgeBase:
         return kb
 
 
+def _spec_key(spec):
+    if isinstance(spec, Enumeration):
+        return ("enum",) + tuple(_value_key(m) for m in spec.members)
+    if isinstance(spec, EntityType):
+        return ("entity", spec.name)
+    return (_field_kind(spec),)
+
+
 def _atoms_of(f) -> list:
     if isinstance(f, Atom):
         return [f]
@@ -672,6 +682,24 @@ def _fields_from_dict(pred: Predicate, fields: dict, kb: KnowledgeBase, vars_: d
     return out
 
 
+def atom_from_dict(d, predicates: dict, kb: Optional[KnowledgeBase] = None,
+                   vars_: Optional[dict] = None) -> Atom:
+    """An atom from a claim name or {"predicate": name, "fields": {...}};
+    {"var": name} field values become variables shared through `vars_`."""
+    vars_ = vars_ if vars_ is not None else {}
+    kb = kb or KnowledgeBase()
+    if isinstance(d, str):
+        name, fields = d, {}
+    elif isinstance(d, dict) and isinstance(d.get("predicate"), str):
+        name, fields = d["predicate"], d.get("fields") or {}
+    else:
+        raise ProgrammerError(f"an atom is a claim name or {{\"predicate\", \"fields\"}}, got {d!r}")
+    if name not in predicates:
+        raise ProgrammerError(f"unknown claim {name!r}")
+    pred = predicates[name]
+    return pred(**_fields_from_dict(pred, fields, kb, vars_))
+
+
 def formula_to_dict(f) -> dict:
     if isinstance(f, Atom):
         return {"atom": {"predicate": f.predicate.name, "fields": _fields_to_dict(f.fields)}}
@@ -704,12 +732,7 @@ def formula_from_dict(d, predicates: dict, kb: Optional[KnowledgeBase] = None,
     if k == "not":
         return Not(formula_from_dict(v, predicates, kb, vars_))
     if k == "atom":
-        name = v["predicate"] if isinstance(v, dict) else v
-        if name not in predicates:
-            raise ProgrammerError(f"unknown claim {name!r}")
-        pred = predicates[name]
-        fields = v.get("fields") or {} if isinstance(v, dict) else {}
-        return pred(**_fields_from_dict(pred, fields, kb, vars_))
+        return atom_from_dict(v, predicates, kb, vars_)
     raise ProgrammerError(f"unknown formula operator {k!r}")
 
 

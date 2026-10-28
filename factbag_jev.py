@@ -182,10 +182,10 @@ def _domain(kb: KnowledgeBase, pred: Predicate, name: str) -> list:
         "enumeration or entity fields")
 
 
-def candidates(kb: KnowledgeBase, pred: Predicate) -> list:
+def candidates(kb: KnowledgeBase, pred: Predicate, *, require_description: bool = True) -> list:
     """Every ground atom of the predicate over its fields' domains, without
     the ones that name the same entity twice (Factbag tools.ts)."""
-    if not pred.description:
+    if require_description and not pred.description:
         raise UnsupportedPredicateError(f"{pred.name} has no description for Jev")
     names = list(pred.params)
     domains = [_domain(kb, pred, n) for n in names]
@@ -377,10 +377,14 @@ class ClassificationRun:
 
 def classifier(passages: Iterable[Passage], kb: KnowledgeBase, guard: Optional[Guard] = None, *,
                min_probability: float = 0.4, ambiguity_margin: float = 0.0,
-               max_candidates: int = MAX_CANDIDATES_PER_REQUEST) -> ClassificationRun:
+               max_candidates: int = MAX_CANDIDATES_PER_REQUEST,
+               candidate_filter: Optional[Callable[[Passage, Atom], bool]] = None) -> ClassificationRun:
     """Jobs for every (passage, predicate) the guard lets Jev write. Without a
     guard every predicate of the knowledge base is permitted for assert and
-    deny (Factbag's bare-KB behaviour); then each must be classifiable."""
+    deny (Factbag's bare-KB behaviour); then each must be classifiable.
+    `candidate_filter(passage, atom)` keeps only some candidates for a passage
+    (e.g. the atom about the passage's own symbol); a passage with none left
+    for a predicate gets no job for it."""
     run = ClassificationRun(kb, min_probability, ambiguity_margin)
     preds = {p.name: p for p in kb.predicates()}
     if guard is None:
@@ -395,12 +399,13 @@ def classifier(passages: Iterable[Passage], kb: KnowledgeBase, guard: Optional[G
         actions = guard.actions_for(pred)
         if not actions:
             continue
-        atoms = candidates(kb, pred)
-        for i in range(0, len(atoms), max(1, max_candidates)):
-            tools.append((pred, atoms[i:i + max_candidates], actions))
+        tools.append((pred, candidates(kb, pred), actions))
+    step = max(1, max_candidates)
     for passage in passages:
         for pred, atoms, actions in tools:
-            run.jobs.append(ClassificationJob(run, passage, pred, atoms, actions))
+            keep = atoms if candidate_filter is None else [a for a in atoms if candidate_filter(passage, a)]
+            for i in range(0, len(keep), step):
+                run.jobs.append(ClassificationJob(run, passage, pred, keep[i:i + step], actions))
     return run
 
 

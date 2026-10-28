@@ -117,7 +117,7 @@ def _parse_claims(claims) -> list:
     out = []
     for c in claims or []:
         if isinstance(c, dict) and c.get("name") and c.get("description"):
-            out.append({k: c[k] for k in ("name", "description", "params", "world") if k in c})
+            out.append({k: c[k] for k in ("name", "description", "params", "world", "scope") if k in c})
             continue
         if not isinstance(c, str) or ":" not in c:
             raise ValueError(f"claim {c!r}: write it as \"name: description\"")
@@ -131,11 +131,16 @@ def _parse_claims(claims) -> list:
 
 
 def _evaluate_claims(question: str, claims, rules: str = "", from_commit: str = "",
-                     to_commit: str = "", post=httpx.post) -> dict:
+                     to_commit: str = "", per_symbol: bool = False, post=httpx.post) -> dict:
     """POST /api/claims/evaluate and shape the reply for the agent: one line
-    per conclusion with its value and the passages behind it. Never raises."""
+    per conclusion with its value and the passages behind it (per symbol when
+    `per_symbol`). Never raises."""
     try:
-        body = {"question": question, "claims": _parse_claims(claims),
+        parsed = _parse_claims(claims)
+        if per_symbol:
+            for c in parsed:
+                c.setdefault("scope", "symbol")
+        body = {"question": question, "claims": parsed,
                 "rules": json.loads(rules) if (rules or "").strip() else [],
                 "from_commit": from_commit, "to_commit": to_commit}
     except ValueError as e:
@@ -159,10 +164,15 @@ def _evaluate_claims(question: str, claims, rules: str = "", from_commit: str = 
                          f"{(r.text or '')[:300]}"}
     cls = ((d.get("info") or {}).get("classification") or {})
     passages, failed, jobs = cls.get("passages") or 0, cls.get("failed") or 0, cls.get("jobs") or 0
-    judgments = {k: {"value": v.get("value"), "because": v.get("because"),
-                     "sources": [{kk: s.get(kk) for kk in ("file", "symbol", "line", "id")}
-                                 for s in (v.get("sources") or [])]}
-                 for k, v in d["judgments"].items()}
+    def compact(v):
+        if v.get("scope") == "symbol":
+            return {"scope": "symbol", "summary": v.get("summary"),
+                    "by_symbol": [{kk: r.get(kk) for kk in ("file", "symbol", "line", "value")}
+                                  for r in (v.get("by_symbol") or [])]}
+        return {"value": v.get("value"), "because": v.get("because"),
+                "sources": [{kk: s.get(kk) for kk in ("file", "symbol", "line", "id")}
+                            for s in (v.get("sources") or [])]}
+    judgments = {k: compact(v) for k, v in d["judgments"].items()}
     if passages == 0:
         note = ("No evidence: nothing was retrieved for the question, so every claim "
                 "is unknown. Say so; do not guess.")
@@ -179,7 +189,7 @@ def _evaluate_claims(question: str, claims, rules: str = "", from_commit: str = 
 
 @mcp.tool()
 def evaluate_claims(question: str, claims: list[str], rules: str = "",
-                    from_commit: str = "", to_commit: str = "") -> str:
+                    from_commit: str = "", to_commit: str = "", per_symbol: bool = False) -> str:
     """Check specific claims about the code against the evidence.
 
     Give the question that finds the relevant code and the claims to assess,
@@ -189,10 +199,13 @@ def evaluate_claims(question: str, claims: list[str], rules: str = "",
     conflicted or unknown with the file, symbol and line of the passages it
     rests on. Optional `rules` (a JSON list) combine claims:
     [{"head": "safe", "iff": {"and": ["validates_input", {"not": "logs_secret"}]}}].
-    Report the values as given; unknown means the evidence was silent, not
-    that the claim is false. Takes 20–90 seconds.
+    With per_symbol=true each claim is judged for every retrieved symbol
+    from its own body, and the reply lists file:symbol:line = value rows
+    ("which of these functions validate input"). Report the values as given;
+    unknown means the evidence was silent, not that the claim is false. Takes
+    20–90 seconds.
     """
-    return json.dumps(_evaluate_claims(question, claims, rules, from_commit, to_commit),
+    return json.dumps(_evaluate_claims(question, claims, rules, from_commit, to_commit, per_symbol),
                       ensure_ascii=False, indent=1)
 
 

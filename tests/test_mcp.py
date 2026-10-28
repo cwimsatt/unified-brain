@@ -201,3 +201,22 @@ def test_evaluate_claims_bad_input_and_errors_never_raise():
         "HTTP 400: claims: bad"
     assert "no evaluation" in ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(200, text="<html>")))["error"]
     assert "no evaluation" in ub._evaluate_claims("q", ["a: b"], post=_post_returning(_Resp(200, {"id": "x"})))["error"]
+
+
+def test_evaluate_claims_per_symbol_sends_the_scope_and_compacts_rows():
+    reply = _claims_reply({"calls_out": {"scope": "symbol", "summary": {"true": 1, "unknown": 1, "false": 0, "conflicted": 0},
+                                         "by_symbol": [{"file": "a.py", "symbol": "f", "line": 1, "value": "true",
+                                                        "sources": [], "explanation": {"big": "tree"}},
+                                                       {"file": "a.py", "symbol": "g", "line": 9, "value": "unknown"}]}})
+    post = _post_returning(_Resp(200, reply))
+    out = ub._evaluate_claims("q", ["calls_out: The function calls another function."], per_symbol=True, post=post)
+    assert post.calls[0]["json"]["claims"] == [{"name": "calls_out", "description": "The function calls another function.",
+                                                 "scope": "symbol"}]
+    assert out["judgments"]["calls_out"] == {
+        "scope": "symbol", "summary": {"true": 1, "unknown": 1, "false": 0, "conflicted": 0},
+        "by_symbol": [{"file": "a.py", "symbol": "f", "line": 1, "value": "true"},
+                      {"file": "a.py", "symbol": "g", "line": 9, "value": "unknown"}]}
+    # an explicit scope in a dict claim is kept
+    post = _post_returning(_Resp(200, reply))
+    ub._evaluate_claims("q", [{"name": "x", "description": "d", "scope": "evidence"}], per_symbol=True, post=post)
+    assert post.calls[0]["json"]["claims"][0]["scope"] == "evidence"

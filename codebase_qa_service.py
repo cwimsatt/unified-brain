@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
-from typing import Optional, Literal
+from typing import Any, Optional, Literal
 from pydantic import BaseModel
 from templates import HTML, TIMELINE_HTML
 import httpx
@@ -5232,13 +5232,20 @@ class ClaimSpec(BaseModel):
     description: str
     params: dict[str, list] = {}       # field -> finite list of values (an enumeration)
     world: Literal["open", "closed"] = "open"
+    # "evidence": one claim over all retrieved code ("some body returns a
+    # greeting"); "symbol": one candidate per retrieved symbol, each judged
+    # from its own body only ("which bodies return a greeting")
+    scope: Literal["evidence", "symbol"] = "evidence"
 
 
 class RuleSpec(BaseModel):
     """{"head": "ready", "if": <formula>} or {"head": ..., "iff": <formula>}.
     A formula is a claim name, {"not": f}, {"and": [f...]}, {"or": [f...]} or
-    {"atom": {"predicate": name, "fields": {...}}} for claims with params."""
-    head: str
+    {"atom": {"predicate": name, "fields": {...}}} for claims with params. The
+    head is a name or {"predicate": name, "fields": {"symbol": {"var": "S"}}}
+    for a conclusion per symbol; a new head's parameter types follow from how
+    its variables are used in the body."""
+    head: Any
     model_config = {"extra": "allow"}
 
 
@@ -5277,9 +5284,56 @@ def _claims_settings(req: ClaimsRequest) -> dict:
     }
 
 
+def _rule_head(r) -> tuple:
+    """(name, fields) of a RuleSpec head, which is a name or a dict."""
+    h = r.head
+    if isinstance(h, str):
+        return h, {}
+    if isinstance(h, dict) and isinstance(h.get("predicate"), str):
+        return h["predicate"], dict(h.get("fields") or {})
+    raise _fb.ProgrammerError(f"rule head {h!r}: a claim name or {{\"predicate\", \"fields\"}}")
+
+
+def _var_usage(body, preds: dict, usage: dict) -> dict:
+    """variable name -> (predicate, field) of its first use in a formula dict."""
+    if isinstance(body, dict):
+        if "atom" in body:
+            a = body["atom"]
+            name = a.get("predicate") if isinstance(a, dict) else a
+            fields = (a.get("fields") or {}) if isinstance(a, dict) else {}
+            pred = preds.get(name)
+            if pred is not None:
+                for k, v in fields.items():
+                    if isinstance(v, dict) and "var" in v and k in pred.params:
+                        usage.setdefault(v["var"], (pred, k))
+        for k, v in body.items():
+            if k in ("and", "or"):
+                for x in v:
+                    _var_usage(x, preds, usage)
+            elif k == "not":
+                _var_usage(v, preds, usage)
+    return usage
+
+
+def _infer_params(head_fields: dict, body, preds: dict) -> dict:
+    """Parameter types of a new rule head: each head variable takes the type
+    of the first body position it fills."""
+    usage = _var_usage(body, preds, {})
+    params = {}
+    for k, v in head_fields.items():
+        if not (isinstance(v, dict) and "var" in v):
+            raise _fb.ProgrammerError(f"a new rule head takes variables only, got {k}={v!r}")
+        if v["var"] not in usage:
+            raise _fb.ProgrammerError(f"rule head variable {v['var']!r} is not used in the body")
+        pred, field = usage[v["var"]]
+        params[k] = pred.params[field]
+    return params
+
+
 def _claims_build(claims: list, rules: list, facts: list) -> tuple:
-    """(kb, predicates by name, guard, queried atoms) from the request, or
-    HTTPException(400) naming the problem."""
+    """(kb, predicates by name, guard, rule head names) from the request, or
+    HTTPException(400) naming the problem. Symbol entities are added to the
+    knowledge base later, once the evidence is known."""
     kb = _fb.KnowledgeBase()
     preds: dict = {}
     try:
@@ -5290,28 +5344,36 @@ def _claims_build(claims: list, rules: list, facts: list) -> tuple:
                 raise _fb.ProgrammerError(f"claim {c.name!r} is listed twice")
             if not c.description.strip():
                 raise _fb.ProgrammerError(f"claim {c.name!r} needs a description for Jev")
+            if "symbol" in c.params:
+                raise _fb.ProgrammerError(f"claim {c.name!r}: 'symbol' is the per-symbol scope's "
+                                          "own parameter; name the enumeration differently")
             params = {k: _fb.enumeration(*v) for k, v in c.params.items()}
+            if c.scope == "symbol":
+                params = {"symbol": _fb.entity("symbol"), **params}
             preds[c.name] = _fb.Predicate(c.name, params, world=c.world, description=c.description)
         kb.declare(*preds.values())
         heads = []
         for r in rules:
             extra = r.model_extra or {}
             body = {k: extra[k] for k in ("if", "iff") if k in extra}
+            name, head_fields = _rule_head(r)
             if len(body) != 1:
-                raise _fb.ProgrammerError(f"rule {r.head!r}: give exactly one of \"if\" or \"iff\"")
-            if not _CLAIM_NAME.match(r.head):
-                raise _fb.ProgrammerError(f"rule head {r.head!r}: use letters, digits and _")
-            if r.head not in preds:                 # a derived conclusion, never classified
-                preds[r.head] = _fb.predicate(r.head)
-                kb.declare(preds[r.head])
+                raise _fb.ProgrammerError(f"rule {name!r}: give exactly one of \"if\" or \"iff\"")
+            if not _CLAIM_NAME.match(name):
+                raise _fb.ProgrammerError(f"rule head {name!r}: use letters, digits and _")
             (kind, f), = body.items()
-            formula = _fb.formula_from_dict(f, preds, kb)
-            getattr(kb.rule(preds[r.head]()), "if_" if kind == "if" else "iff")(formula)
-            heads.append(r.head)
+            if name not in preds:                   # a derived conclusion, never classified
+                preds[name] = _fb.Predicate(name, _infer_params(head_fields, f, preds))
+                kb.declare(preds[name])
+            vars_: dict = {}
+            head = _fb.atom_from_dict({"predicate": name, "fields": head_fields}, preds, kb, vars_)
+            formula = _fb.formula_from_dict(f, preds, kb, vars_)
+            getattr(kb.rule(head), "if_" if kind == "if" else "iff")(formula)
+            heads.append(name)
         for f in facts:
             if f.claim not in preds:
                 raise _fb.ProgrammerError(f"fact {f.claim!r} names no claim or rule head")
-            atom = preds[f.claim](**f.fields)
+            atom = _fb.atom_from_dict({"predicate": f.claim, "fields": f.fields}, preds, kb)
             (kb.asserts if f.value else kb.denies)(atom, source=f.source or "application")
     except _fb.ProgrammerError as e:
         raise HTTPException(400, f"claims: {e}")
@@ -5321,19 +5383,23 @@ def _claims_build(claims: list, rules: list, facts: list) -> tuple:
     return kb, preds, guard, heads
 
 
-def _claims_passages(rows: list, passage_chars: int) -> list:
-    """Evidence rows (as /api/retrieve returns them) -> passages whose doc id
-    is the symbol's def_key, so a source maps back to file, symbol and line."""
-    out = []
+def _claims_passages(rows: list, passage_chars: int) -> tuple:
+    """Evidence rows (as /api/retrieve returns them) -> (passages, symbol
+    entities). A passage's doc id is the symbol's def_key, so a source maps
+    back to file, symbol and line; the entity with the same id is what a
+    per-symbol claim is about."""
+    passages, entities = [], []
     for row in rows:
         text = row.get("code") or ""
         if not text.strip():
             continue
         doc_id = row.get("def_key") or f"{row.get('file', '')}:{row.get('symbol', '')}" or row.get("skill_id", "")
         meta = {k: row.get(k) for k in ("def_key", "file", "symbol", "line", "struct", "skill_id")}
-        out.extend(_fbj.split_passages(doc_id, text, size=passage_chars,
-                                       overlap=min(200, passage_chars // 4), meta=meta))
-    return out
+        passages.extend(_fbj.split_passages(doc_id, text, size=passage_chars,
+                                            overlap=min(200, passage_chars // 4), meta=meta))
+        entities.append(_fb.Entity("symbol", doc_id, **{k: row.get(k) for k in ("file", "symbol", "line", "struct")
+                                                           if row.get(k) not in (None, "")}))
+    return passages, entities
 
 
 def _claims_rows_for_skills(org_redis, skill_ids: list) -> list:
@@ -5359,25 +5425,37 @@ def _claims_sources(node: dict, acc: set) -> set:
 
 
 def _claims_judge(kb, preds: dict, claims: list, heads: list, passages_by_id: dict) -> dict:
-    """Query every claim atom (each enumeration member for claims with params)
-    and every rule head; each judgment carries its proof tree and the passages
-    it rests on."""
-    out: dict = {}
-    for name in [c.name for c in claims] + heads:
-        pred = preds[name]
-        atoms = _fbj.candidates(kb, pred) if pred.params else [pred()]
-        for atom in atoms:
-            j = _fb.query(kb, atom)
-            tree = _fb.explain(j)
-            srcs = sorted(_claims_sources(tree, set()))
-            out[repr(atom) if pred.params else name] = {
-                "value": j.value,
-                "because": tree.get("because"),
+    """Query every claim atom (each enumeration member for claims with params,
+    each symbol for per-symbol ones) and every rule head; each judgment
+    carries its proof tree and the passages it rests on. A predicate with a
+    symbol parameter is reported once, with a row per symbol and a summary."""
+    def judged(atom):
+        j = _fb.query(kb, atom)
+        tree = _fb.explain(j)
+        srcs = sorted(_claims_sources(tree, set()))
+        return {"value": j.value, "because": tree.get("because"),
                 "sources": [{"id": s, **{k: v for k, v in (passages_by_id.get(s) or {}).items()
                                          if k in ("file", "symbol", "line", "struct", "def_key")}}
                             for s in srcs],
-                "explanation": tree,
-            }
+                "explanation": tree}
+
+    out: dict = {}
+    for name in [c.name for c in claims] + heads:
+        pred = preds[name]
+        atoms = _fbj.candidates(kb, pred, require_description=False) if pred.params else [pred()]
+        if "entity" in pred.kinds.values():
+            rows = []
+            for atom in atoms:
+                ent = next(v for v in atom.fields.values() if isinstance(v, _fb.Entity))
+                rows.append({"def_key": ent.id, **{k: ent.attrs.get(k) for k in ("file", "symbol", "line", "struct")},
+                             "atom": repr(atom), **judged(atom)})
+            rows.sort(key=lambda r: (r.get("file") or "", r.get("line") or 0, r["atom"]))
+            out[name] = {"scope": "symbol",
+                         "summary": {v: sum(1 for r in rows if r["value"] == v) for v in _fb.VALUES},
+                         "by_symbol": rows}
+            continue
+        for atom in atoms:
+            out[repr(atom) if pred.params else name] = judged(atom)
     return out
 
 
@@ -5402,7 +5480,7 @@ def _claims_rebuild(rec: dict) -> tuple:
     kb = _fb.KnowledgeBase.from_dict(rec["kb"])
     preds = {p.name: p for p in kb.predicates()}
     claims = [ClaimSpec(**c) for c in rec["claims"]]
-    heads = [r["head"] for r in rec["rules"]]
+    heads = [r["head"] if isinstance(r["head"], str) else r["head"]["predicate"] for r in rec["rules"]]
     for name in [c.name for c in claims] + heads:
         if name not in preds:                       # declared but never mentioned
             preds[name] = _fb.predicate(name)
@@ -5438,9 +5516,14 @@ async def api_claims_evaluate(req: ClaimsRequest):
         rows, window = got["evidence"], got["window"]
         info["retrieval"] = {"mode": "question", "evidence": len(rows), **got["info"]}
     rows = rows[:cfg["max_passages"]]
-    passages = _claims_passages(rows, cfg["passage_chars"])[:cfg["max_passages"]]
+    passages, entities = _claims_passages(rows, cfg["passage_chars"])
+    passages = passages[:cfg["max_passages"]]
+    kb.entities.add(*entities)
+    scoped = {c.name for c in req.claims if c.scope == "symbol"}
+    cand_filter = ((lambda p, a: a.predicate.name not in scoped or a.fields["symbol"].id == p.doc_id)
+                   if scoped else None)
     run = _fbj.classifier(passages, kb, guard, min_probability=cfg["min_probability"],
-                          ambiguity_margin=cfg["ambiguity_margin"])
+                          ambiguity_margin=cfg["ambiguity_margin"], candidate_filter=cand_filter)
     workers = max(1, min(int(os.environ.get("JEV_CONCURRENCY", "128")), len(run.jobs) or 1))
     client = _jev_client(max_connections=workers)
     try:
