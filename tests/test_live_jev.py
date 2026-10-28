@@ -68,3 +68,28 @@ def test_jev_resolves_a_superseded_passage():
     assert old.id in [r["source"] for r in res["retracted"]]
     assert query(run.kb, limit()).value in ("false", "unknown")
     assert run.cost > 0
+
+
+def test_live_probe_claims_on_the_fixture_change(service, ingested_db):
+    """The four probe claims, judged by the real Jev from hello's body and
+    the diff that changed its greeting. Prints the values and cost."""
+    r = ingested_db.r
+    commits = [c.decode() if isinstance(c, bytes) else c for c in r.zrange("commit_order", 0, -1)]
+    items = service._expand_probe_units(service._collect_range_items(r, commits[0], commits[-1]))
+    item = next(i for i in items if i["symbol"] == "hello" and i["commit"] == commits[-1])
+    diffs = service._touch_diffs(r, item)
+    body = 'def hello():\n    return "hello, world"\n'
+    passages = service._probe_claim_passages("pkg/app.py:hello:4:FunctionDef", "pkg/app.py", "hello",
+                                             item, body, diffs, [])
+    info = {"jev_cost": 0.0}
+    res = service._probe_claims(item["goal"], passages, info)
+    print("\nlive probe claims:", res["summary"]["values"], f"${res['cost_usd']:.5f}",
+          {k: v["evidence"][:1] for k, v in res["judgments"].items() if v["evidence"]},
+          {k: res[k] for k in ("passages", "jobs", "failed", "first_error")})
+    # mechanics only: Jev's reading of a greeting edit against a commit
+    # message that also names other files is its own (on 2026-10-28 it denied
+    # achieves_stated_goal at 0.54 from the body alone)
+    assert res["failed"] == 0, res["first_error"]
+    assert res["jobs"] == 4 * res["passages"] and res["passages"] >= 2
+    assert res["cost_usd"] > 0 and info["jev_cost"] == pytest.approx(res["cost_usd"], abs=1e-6)
+    assert res["summary"]["values"]["is_suspicious"] != "true"

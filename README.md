@@ -326,6 +326,16 @@ does the same with `per_symbol=true`. Rules then take variables:
 
 A new rule head takes the types of its variables from the body.
 
+The timeline report uses the same layer: every probe also has Jev answer
+four fixed claims about the change (achieves the stated goal, introduces a
+defect, is suspicious, is dormant) from the texts the judge reads, shown as
+badges next to the verdict with their sources in the Evidence panel. When a
+defect claim is true and harsher than the verdict it is filed as a finding
+by `claims:<probe>`, so the probe is contested and rerun once with it as a
+lead; a severe verdict that both defect claims deny is marked "claims
+milder". `PROBE_CLAIMS=0` skips the pass, `PROBE_CLAIMS_FINDINGS=0` keeps
+the badges without the findings.
+
 ### What a question costs
 
 Measured with the configuration in Part 1 of `env.example`:

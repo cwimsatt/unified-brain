@@ -1163,6 +1163,12 @@ TIMELINE_HTML = """<!DOCTYPE html>
   .probe-rerun:disabled { opacity: 0.35; cursor: default; }
   .badge.contested { color: var(--amber); border-color: var(--amber-dim);
     background: var(--amber-tint); cursor: pointer; }
+  .badge.claim { color: var(--text-dim); border-color: var(--border); }
+  .badge.claim.good { color: var(--green); border-color: var(--green-border); }
+  .badge.claim.bad { color: var(--red); border-color: var(--red-border); background: var(--red-tint); }
+  .badge.claim.warn { color: var(--amber); border-color: var(--amber-dim); }
+  .badge.claim.disagree { color: var(--amber); border-color: var(--amber-dim);
+    background: var(--amber-tint); }
   .worst-dot { width: 8px; height: 8px; border-radius: 50%;
     display: inline-block; flex: none; }
   .worst-dot.BENIGN { background: var(--green); }
@@ -1704,15 +1710,29 @@ function renderEvidence(ev) {
   const j = ev.judge;
   head('Judge');
   if (j) {
-    row((j.kind === 'jev' ? 'Jev' : 'LLM') + ' <code>' + esc(j.model) + '</code>');
+    row('LLM <code>' + esc(j.model) + '</code>');
     row('<span class="ev-dim">It was given: ' + esc(j.given) + '</span>');
     row('input' + evSize(j.input_chars) + evHash(j.input_sha256)
       + ' · gathered evidence' + evSize(j.evidence_chars) + evHash(j.evidence_sha256)
       + (j.context_chars != null ? ' · related-skill context' + evSize(j.context_chars) + evHash(j.context_sha256) : ''));
-    if (j.probs) row('<span class="ev-dim">' + Object.entries(j.probs).sort((a, b) => b[1] - a[1])
-      .map(([k, p]) => esc(k.toLowerCase()) + ' ' + Math.round(p * 100) + '%').join(' · ') + '</span>');
   } else {
     row('<span class="ev-warn">The run ended before a judge was called.</span>');
+  }
+
+  const cl = ev.claims;
+  if (cl && Object.keys(cl).length) {
+    head('Claims (Jev)');
+    const cr = ev.claims_run || {};
+    if (cr.jobs) row('<span class="ev-dim">' + cr.passages + ' passage(s), ' + cr.jobs + ' call(s)'
+      + (cr.failed ? ', ' + cr.failed + ' failed' : '') + ', $' + (+cr.cost_usd || 0).toFixed(4) + '</span>');
+    for (const [k, v] of Object.entries(cl)) {
+      row('<b>' + esc(k) + '</b> = ' + esc(v.value || '?')
+        + (v.because ? ' <span class="ev-dim">(' + esc(v.because) + ')</span>' : '')
+        + ((v.sources || []).length
+           ? '<br>' + v.sources.map(s => '<span class="ev-chip">' + esc((s.kind || '') + ' · '
+               + (s.file || '') + (s.symbol ? ' ' + s.symbol : '')) + '</span>').join('')
+           : ''));
+    }
   }
 
   const b = ev.budget;
@@ -1734,6 +1754,21 @@ async function showEvidence(box, pid, key) {
     evidenceCache.set(key, (await r.json()).evidence);
   }
   box.innerHTML = renderEvidence(evidenceCache.get(key));
+}
+
+const CLAIM_LABELS = { achieves_stated_goal: 'goal', introduces_defect: 'defect',
+                       is_suspicious: 'suspicious', is_dormant: 'dormant' };
+function claimBadges(c) {
+  if (!c || !c.values) return '';
+  const tone = (k, v) => v === 'conflicted' ? 'warn' : (v === 'unknown' ? ''
+    : (k === 'achieves_stated_goal' ? (v === 'true' ? 'good' : 'bad')
+       : (k === 'is_dormant' ? (v === 'true' ? 'warn' : '')
+          : (v === 'true' ? 'bad' : 'good'))));
+  return Object.entries(CLAIM_LABELS).filter(([k]) => k in c.values).map(([k, label]) =>
+    '<span class="badge claim ' + tone(k, c.values[k]) + '" title="Jev: ' + esc(k) + ' = '
+    + esc(c.values[k]) + '">' + label + ' ' + esc(c.values[k]) + '</span>').join('')
+    + (c.disagree ? '<span class="badge claim disagree" title="Jev\'s claims and the judge\'s verdict disagree">claims '
+       + esc(c.disagree) + '</span>' : '');
 }
 
 function probeEl(p) {
@@ -1758,6 +1793,7 @@ function probeEl(p) {
          + (p.contested ? '⚑ contested' : '⚑ ' + p.findings_in.length)
          + '</span>'
        : '')
+    + claimBadges(p.claims)
     + '<span class="verdict ' + (p.verdict || 'PENDING') + '">'
     + (p.verdict || 'PENDING') + '</span>'
     + (p.verdict && p.verdict !== 'PENDING'
@@ -1862,7 +1898,8 @@ async function viewReport(rid, page) {
   if (seq !== reportSeq) return;
   const isNewSelection = rid !== currentReportId;
   const fp = rid + '|' + vf + '|' + cf + '|' + d.page + '|' + d.meta.done + '|' + d.meta.status + '|'
-    + d.probes.map(p => (p.probe_id || p.skill_id) + ':' + (p.verdict || '')).join(',');
+    + d.probes.map(p => (p.probe_id || p.skill_id) + ':' + (p.verdict || '')
+        + ':' + Object.values((p.claims || {}).values || {}).join('')).join(',');
   if (rid === currentReportId && fp === lastReportFingerprint) {
     if (d.meta.status === 'running') startPolling(rid);
     return d.meta.status !== 'running';

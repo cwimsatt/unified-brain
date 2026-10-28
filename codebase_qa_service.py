@@ -2740,6 +2740,7 @@ def _rewind_probe(org_redis, rid: str, sid: str) -> None:
         return
     rec = json.loads(raw)
     rec.update({"verdict": "PENDING", "answer": "", "error": ""})
+    rec.pop("claims", None)
     pipe = org_redis.pipeline(transaction=False)
     pipe.hset(probes_k, sid, json.dumps(rec))
     pipe.hset(f"report:{rid}:vmap", sid, "PENDING")
@@ -2762,7 +2763,7 @@ def _persist_probe_result(org_redis, rid: str, sid: str,
     raw = org_redis.hget(probes_k, sid)
     rec = json.loads(raw) if raw else {"skill_id": sid}
     if extra:
-        rec.update(extra)
+        rec.update({k: v for k, v in extra.items() if v is not None})
     if floor_verdict and rec.get("history"):
         # Contested rerun = safety net: it may RAISE severity, never lower it.
         # The prior verdict was stamped from the probe's own reads; a fresh
@@ -2774,6 +2775,11 @@ def _persist_probe_result(org_redis, rid: str, sid: str,
                           f"returned {verdict}; prior verdict {prev} kept — "
                           "contested reruns can only raise severity.]")
             verdict, error = prev, ""
+    findings = list(findings or [])
+    claims = rec.get("claims") if extra and extra.get("claims") else None
+    if isinstance(claims, dict) and isinstance(claims.get("values"), dict):
+        findings += _claims_findings(claims, verdict, sid, rec)
+        rec["claims"] = claims
     rec.update({"verdict": verdict, "answer": answer, "error": error})
     rec.setdefault("history", []).append(
         {"verdict": verdict, "ts": int(time.time()), "model": model})
@@ -2786,12 +2792,59 @@ def _persist_probe_result(org_redis, rid: str, sid: str,
         return False
     pipe = org_redis.pipeline(transaction=False)
     for f in (findings or []):
-        fkey = f"{f['file']}@{f['commit'][:12]}|{sid}"
+        by = f.get("by") or sid                 # "claims:<sid>" for Jev's claims
+        fkey = f"{f['file']}@{f['commit'][:12]}|{by}"
         pipe.hset(f"report:{rid}:findings", fkey, json.dumps(dict(
-            f, by=sid, ts=int(time.time()), model=model)))
+            f, by=by, ts=int(time.time()), model=f.get("model") or model)))
     pipe.hset(meta_k, "last_progress_at", datetime.utcnow().isoformat())
     pipe.execute()
     return True
+
+
+# Claims judged by Jev for every probe (see _probe_claims): name, description
+# template, and the finding severity a `true` answer raises when it outranks
+# the judge's verdict (None: badge only).
+PROBE_CLAIMS = (
+    ("achieves_stated_goal",
+     "The change does what this commit message says: «{goal}».", None),
+    ("introduces_defect",
+     "The change introduces a bug, regression or unsafe behaviour in the code shown.",
+     "MAJOR_FLAW"),
+    ("is_suspicious",
+     "The change hides behaviour, exfiltrates data, weakens a check, or is otherwise "
+     "not what a good-faith author would write for the stated goal.", "SUSPICIOUS"),
+    ("is_dormant",
+     "The change adds code that is not reachable or not used from the code shown.", None),
+)
+
+
+def _claims_findings(claims: dict, verdict: str, sid: str, rec: dict) -> list:
+    """Compare Jev's claims with the judge's verdict. A defect claim that is
+    true and outranks the verdict becomes a finding by "claims:<sid>" (so the
+    probe is contested and rerun once, like a finding from another probe);
+    a severe verdict with both defect claims false is noted as "milder".
+    Records the outcome in claims["disagree"] / claims["findings"]."""
+    vals = claims["values"]
+    own = _SEV_RANK.get(verdict, 0)
+    out, harsher = [], []
+    if os.environ.get("PROBE_CLAIMS_FINDINGS", "1") == "1":
+        for name, _tmpl, sev in PROBE_CLAIMS:
+            if sev and vals.get(name) == "true" and _SEV_RANK.get(sev, 0) > own:
+                harsher.append(name)
+                srcs = (claims.get("sources") or {}).get(name) or []
+                out.append({"file": (rec.get("loc") or "").rsplit(":", 1)[0],
+                            "commit": rec.get("commit") or "",
+                            "severity": sev,
+                            "note": (f"Jev's claim {name} is true for this change"
+                                     + (f" (from {', '.join(srcs[:3])})" if srcs else "")),
+                            "by": f"claims:{sid}",
+                            "model": JEV_MODEL})
+    milder = (verdict in ("MAJOR_FLAW", "SUSPICIOUS", "FLAGRANTLY_MALICIOUS")
+              and vals.get("introduces_defect") == "false"
+              and vals.get("is_suspicious") == "false")
+    claims["disagree"] = "harsher" if harsher else ("milder" if milder else None)
+    claims["findings"] = harsher
+    return out
 
 def _finalize_report(org_redis, rid: str, status: str = "done") -> None:
     """'stopped' / 'error' pass through. 'done' is never taken on faith: it is
@@ -3762,8 +3815,9 @@ async def _run_probe_fast(question, context, item, diffs, target, org_redis,
                 blocks.append(f"## {tool} `{sym}`\n" + res)
 
         # 3. Jev name chains, started from the changed lines
+        goal = "; ".join(t.get("goal") or "" for t in touches).strip("; ")
+        extra: list = []
         if body and not _jev_key_missing():
-            goal = "; ".join(t.get("goal") or "" for t in touches).strip("; ")
             diff_cap = int(os.environ.get("PROBE_FAST_QUESTION_DIFF_CHARS", "6000"))
             chain_q = (
                 f"A commit with the stated goal \"{goal or '(none recorded)'}\" "
@@ -3880,6 +3934,21 @@ async def _run_probe_fast(question, context, item, diffs, target, org_redis,
                     "evidence. Do not state what they contain.\n"
                     + "\n".join(f"- {l['file']} `{l['symbol']}` — chain: "
                                 f"{l['trail']}" for l in xi["leads"]))
+
+        # 4. Claims: Jev answers four fixed questions about the change from
+        #    the same texts (target body, diffs, bodies read). They are
+        #    stored with the probe and shown in the timeline; a claim
+        #    harsher than the judge's verdict becomes a FINDING
+        #    (_persist_probe_result), so the probe is contested and rerun.
+        if (os.environ.get("PROBE_CLAIMS", "1") == "1" and body
+                and not _jev_key_missing()):
+            cpass = _probe_claim_passages(sk.get("def_key") or f"{fp}:{sym}",
+                                          fp, sym, item, body, diffs, extra)
+            res = _probe_claims(goal, cpass, info)
+            ev["claims"] = res["judgments"]
+            ev["claims_summary"] = res["summary"]
+            ev["claims_run"] = {k: res[k] for k in ("passages", "jobs", "failed",
+                                                      "first_error", "cost_usd")}
 
         # evidence budget: blocks go in by priority; cuts are marked
         cap = int(os.environ.get("PROBE_FAST_EVIDENCE_CHARS", "300000"))
@@ -4142,6 +4211,7 @@ async def _run_report_job(report_id, items, target, org_redis, org_redis_binary,
 
     try:
         sem = asyncio.Semaphore(REPORT_CONCURRENCY)
+        claims_by_sid: dict = {}        # probe_id -> compact claims summary
 
         async def _guarded(item):
             async with sem:
@@ -4185,6 +4255,7 @@ async def _run_report_job(report_id, items, target, org_redis, org_redis_binary,
                 # What this run read, kept with the report. It is
                 # removed only when the probe is reopened or the
                 # report is deleted.
+                claims_by_sid[item["probe_id"]] = ev_rec.pop("claims_summary", None)
                 ev_rec.update({"probe_id": item["probe_id"],
                                "run_verdict": verdict, "error": err or "",
                                "ts": int(time.time()),
@@ -4248,6 +4319,7 @@ async def _run_report_job(report_id, items, target, org_redis, org_redis_binary,
                 await asyncio.to_thread(
                     _persist_probe_result, org_redis, report_id, sid,
                     verdict, text, err, findings, target.model,
+                    extra={"claims": claims_by_sid.get(sid)},
                 )
         if phase == "probes":
             await asyncio.to_thread(_set_report_phase, org_redis, report_id, "reconcile")
@@ -4324,7 +4396,8 @@ async def _run_report_job(report_id, items, target, org_redis, org_redis_binary,
                     await asyncio.to_thread(
                         _persist_probe_result, org_redis, report_id, sid,
                         verdict, text, err, findings, target.model,
-                        True)                                   # floor_verdict
+                        True,                                   # floor_verdict
+                        extra={"claims": claims_by_sid.get(sid)})
         except Exception as e:
             print(f"⚠️  contested pass failed (non-fatal): {_scrub(str(e))}")
         if lease_lost.is_set():
@@ -4385,6 +4458,7 @@ async def _launch_report_job(report_id: str) -> int:
             rec = json.loads(raw)
             if rec.get("verdict") == "ERROR":
                 rec.update({"verdict": "PENDING", "answer": "", "error": ""})
+                rec.pop("claims", None)
                 pipe.hset(f"report:{report_id}:probes", it["probe_id"], json.dumps(rec))
                 pipe.hset(f"report:{report_id}:vmap", it["probe_id"], "PENDING")
         pipe.hset(f"report:{report_id}", mapping={
@@ -4811,6 +4885,7 @@ async def _rerun_single_probe(report_id, item, target, org_redis,
         except asyncio.TimeoutError:
             text, verdict, err, findings = \
                 "", "ERROR", "probe re-run timed out", []
+        claims_summary = ev_rec.pop("claims_summary", None)
         ev_rec.update({"probe_id": item["probe_id"],
                        "run_verdict": verdict, "error": err or "",
                        "ts": int(time.time()), "jev_model": JEV_MODEL})
@@ -4836,6 +4911,7 @@ async def _rerun_single_probe(report_id, item, target, org_redis,
         await asyncio.to_thread(
             _persist_probe_result, org_redis, report_id,
             item["probe_id"], verdict, text, err, findings, target.model,
+            extra={"claims": claims_summary},
         )
     except Exception as e:
         err_flag = True
@@ -4857,6 +4933,9 @@ async def _rerun_single_probe(report_id, item, target, org_redis,
                 final = "done"
             org_redis.hset(f"report:{report_id}", mapping={
                 "status": final, "last_progress_at": datetime.utcnow().isoformat()})
+            if token_stats.get("jev_cost"):
+                org_redis.hincrbyfloat(f"report:{report_id}", "jev_cost_usd",
+                                       token_stats["jev_cost"])
         await asyncio.to_thread(_settle)
         _lease_release(report_id)
         print(f"⏱  probe re-run done in {time.time() - start:.0f}s, "
@@ -4904,6 +4983,7 @@ async def rerun_probe(report_id: str, skill_id: str):
             return None, None, "Skill no longer resolvable in this range"
         pipe = org_redis.pipeline(transaction=False)
         prev["verdict"], prev["answer"], prev["error"] = "PENDING", "", ""
+        prev.pop("claims", None)
         pipe.hset(probes_k, skill_id, json.dumps(prev))
         pipe.hset(f"report:{report_id}:vmap", skill_id, "PENDING")
         pipe.hset(meta_k, mapping={
@@ -5486,6 +5566,73 @@ def _claims_rebuild(rec: dict) -> tuple:
             preds[name] = _fb.predicate(name)
             kb.declare(preds[name])
     return kb, preds, claims, heads, {p["id"]: p for p in rec["passages"]}
+
+
+def _probe_claim_passages(doc_base: str, fp: str, sym: str, item: dict, body: str,
+                          diffs: list, extra: list) -> list:
+    """The texts a probe's claims are judged from, as passages: the target's
+    body as of the probed commit, each diff, and the bodies the chains read."""
+    size = int(os.environ.get("CLAIMS_PASSAGE_CHARS", "8000"))
+    ov = min(200, size // 4)
+    commit = item.get("commit", "")
+    out = _fbj.split_passages(f"{doc_base}@{commit}", body, size=size, overlap=ov,
+                              meta={"kind": "body", "file": fp, "symbol": sym, "commit": commit})
+    for d in diffs:
+        if d.get("diff"):
+            out += _fbj.split_passages(f"{doc_base}@{d.get('commit', '')}#diff", d["diff"],
+                                       size=size, overlap=ov,
+                                       meta={"kind": "diff", "file": fp, "symbol": sym,
+                                             "commit": d.get("commit", "")})
+    for e in extra:
+        code = e.get("code") or ""
+        if code.strip():
+            out += _fbj.split_passages(f"{e.get('file_path', '')}:{e.get('symbol', '')}@{commit}",
+                                       code, size=size, overlap=ov,
+                                       meta={"kind": "read", "file": e.get("file_path", ""),
+                                             "symbol": e.get("symbol", ""), "commit": commit})
+    return out
+
+
+def _probe_claims(goal: str, passages: list, info: dict) -> dict:
+    """Jev judges the four PROBE_CLAIMS from the passages. Adds the cost to
+    info["jev_cost"]. Returns {judgments, summary, passages, jobs, failed,
+    first_error, cost_usd}; the summary ({values, sources}) is what the probe
+    record keeps, the judgments (with proof trees) go to the evidence record."""
+    kb = _fb.KnowledgeBase()
+    preds = {name: _fb.predicate(name, description=tmpl.format(goal=goal or "(none recorded)"))
+             for name, tmpl, _sev in PROBE_CLAIMS}
+    kb.declare(*preds.values())
+    guard = _fbj.Guard()
+    for p in preds.values():
+        guard = guard.permit("assert", p).permit("deny", p)
+    run = _fbj.classifier(passages, kb, guard,
+                          min_probability=float(os.environ.get("CLAIMS_MIN_PROBABILITY", "0.4")),
+                          ambiguity_margin=float(os.environ.get("CLAIMS_AMBIGUITY_MARGIN", "0")))
+    failed: list = []
+    if run.jobs:
+        workers = min(16, len(run.jobs))
+        client = _jev_client(max_connections=workers)
+        try:
+            failed = [e for _j, e in run.execute_all(_jev_post, client, workers) if e]
+        finally:
+            client.close()
+    by_id = {p.id: {"id": p.id, **p.meta} for p in passages}
+    judgments, values, sources = {}, {}, {}
+    for name, pred in preds.items():
+        j = _fb.query(run.kb, pred())
+        tree = _fb.explain(j)
+        srcs = sorted(_claims_sources(tree, set()))
+        judgments[name] = {"value": j.value, "because": tree.get("because"),
+                           "sources": [by_id.get(x) or {"id": x} for x in srcs],
+                           "evidence": tree.get("evidence") or []}
+        values[name] = j.value
+        sources[name] = [f"{(by_id.get(x) or {}).get('kind', '?')} of "
+                         f"{(by_id.get(x) or {}).get('symbol', '')}" for x in srcs]
+    info["jev_cost"] = info.get("jev_cost", 0.0) + run.cost
+    info["claims"] = {"jobs": len(run.jobs), "failed": len(failed), "cost": run.cost}
+    return {"judgments": judgments, "summary": {"values": values, "sources": sources},
+            "passages": len(passages), "jobs": len(run.jobs), "failed": len(failed),
+            "first_error": failed[0] if failed else None, "cost_usd": round(run.cost, 6)}
 
 
 @app.post("/api/claims/evaluate")
